@@ -81,7 +81,6 @@ class PublicMessageTests(unittest.TestCase):
         item = public(make_message())
         self.assertEqual(item["sender"], "Ada Lovelace")
         self.assertEqual(item["peer"], "Test Group")
-        self.assertTrue(item["unread"])
         self.assertFalse(item["mine"])
         self.assertEqual(item["text"], "hello world")
 

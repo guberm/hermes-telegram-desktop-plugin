@@ -288,7 +288,6 @@ def _public_message(message: Any, me_id: int) -> dict[str, Any]:
         "peer": _peer_display_name(message.chat if message.chat is not None else message.sender),
         "date": message.date.isoformat() if message.date else "",
         "out": bool(message.out),
-        "unread": not message.out and bool(message.unread),
         "sender": sender_name,
         "text": text[:4096],
         "htmlPreview": sanitize_message_html(text[:4096]),
@@ -317,11 +316,15 @@ def _peer_key(entity: Any) -> str:
     username = getattr(entity, "username", None)
     if username:
         return f"@{username}"
-    identifier = getattr(entity, "id", None)
-    if identifier is None:
-        return ""
-    # Channels/supergroups are negative; keep a plain deterministic key.
-    return f"id:{identifier}"
+    try:
+        from telethon import utils as tg_utils
+
+        # Marked id (channels get -100 prefix) so get_entity(int) can resolve
+        # it back from the session cache.
+        return f"id:{tg_utils.get_peer_id(entity)}"
+    except Exception:
+        identifier = getattr(entity, "id", None)
+        return f"id:{identifier}" if identifier is not None else ""
 
 
 def _clean_provider_text(value: Any, limit: int = _MAX_PROVIDER_TEXT) -> str:
@@ -425,7 +428,7 @@ def _message_snapshot(message: dict[str, Any]) -> dict[str, Any]:
     return dict(sorted(message.items()))
 
 
-def _resolve_peer(client: Any, peer: str) -> Any:
+async def _resolve_peer(client: Any, peer: str) -> Any:
     """Resolve a peer reference string to a Telethon entity, bounded and exact."""
 
     value = peer.strip()
@@ -433,26 +436,26 @@ def _resolve_peer(client: Any, peer: str) -> Any:
         raw = value[3:]
         if not re.fullmatch(r"-?\d{1,15}", raw):
             raise ValueError("invalid peer id")
-        return client.get_entity(int(raw))
+        return await client.get_entity(int(raw))
     if value.startswith("@"):
         username = value[1:]
         if not re.fullmatch(r"[A-Za-z0-9_]{4,64}", username):
             raise ValueError("invalid username")
-        return client.get_entity(f"@{username}")
+        return await client.get_entity(f"@{username}")
     if value.startswith("https://t.me/") or value.startswith("http://t.me/"):
         match = _TOPIC_ROOT_RE.match(value)
         if match:
-            return client.get_entity(int(f"-100{match.group(1)}"))
+            return await client.get_entity(int(f"-100{match.group(1)}"))
         username = value.rsplit("/", 1)[-1]
         if re.fullmatch(r"[A-Za-z0-9_]{4,64}", username):
-            return client.get_entity(f"@{username}")
+            return await client.get_entity(f"@{username}")
         raise ValueError("unsupported t.me link")
     raise ValueError("peer must be @username, id:N, or a t.me link")
 
 
-def _peer_out(client: Any, peer_ref: str) -> tuple[Any, str]:
+async def _peer_out(client: Any, peer_ref: str) -> tuple[Any, str]:
     try:
-        entity = _resolve_peer(client, peer_ref)
+        entity = await _resolve_peer(client, peer_ref)
     except Exception:
         raise _peer_ref_error() from None
     if entity is None:
@@ -515,14 +518,14 @@ def messages(
     scope: ScopeText,
     peer: Annotated[str, Query(max_length=256)],
     limit: Annotated[int, Query(ge=1, le=50)] = 20,
-    topicId: Annotated[int, Query(ge=1, le=10_000_000_000)] = 0,
+    topicId: Annotated[int, Query(ge=0, le=10_000_000_000)] = 0,
 ) -> dict[str, Any]:
     _reject_query_extras(request, {"scope", "peer", "limit", "topicId"})
     binding = _binding(scope)
     me, _ = _provider_context(binding)
 
     async def _collect(client: Any) -> list[dict[str, Any]]:
-        entity, _ = _peer_out(client, peer)
+        entity, _ = await _peer_out(client, peer)
         kwargs: dict[str, Any] = {"limit": limit}
         if topicId:
             kwargs["reply_to"] = topicId
@@ -544,9 +547,9 @@ def messages(
     return {"messages": items, "me": me}
 
 
-def _me_id(client: Any) -> int:
-    me = client.get_me(input_peer=True)
-    return int(getattr(me, "user_id", 0) or 0)
+async def _me_id(client: Any) -> int:
+    me = await client.get_me()
+    return int(getattr(me, "id", 0) or 0)
 
 
 # --- Prepare / commit ---------------------------------------------------------
@@ -561,7 +564,7 @@ def prepare_action(request: Request, body: PrepareRequest) -> dict[str, Any]:
 
     async def _inspect(client: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if body.action in {"send", "reply", "delete", "mark-read"}:
-            entity, name = _peer_out(client, body.peer)
+            entity, name = await _peer_out(client, body.peer)
         if body.action == "send":
             preview = {
                 "action": "send",
@@ -575,7 +578,7 @@ def prepare_action(request: Request, body: PrepareRequest) -> dict[str, Any]:
             target = await client.get_messages(entity, ids=body.messageId)
             if target is None:
                 raise _peer_ref_error("Reply target message no longer exists.")
-            snapshot = _public_message(target, _me_id(client))
+            snapshot = _public_message(target, await _me_id(client))
             preview = {
                 "action": "reply",
                 "me": me,
@@ -600,7 +603,7 @@ def prepare_action(request: Request, body: PrepareRequest) -> dict[str, Any]:
         target = await client.get_messages(entity, ids=body.messageId)
         if target is None:
             raise _peer_ref_error("Message to delete no longer exists.")
-        snapshot = _public_message(target, _me_id(client))
+        snapshot = _public_message(target, await _me_id(client))
         preview = {
             "action": "delete",
             "me": me,
@@ -645,7 +648,7 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
     action = ticket.action
 
     async def _mutate(client: Any) -> dict[str, Any]:
-        entity, name = _peer_out(client, payload["peer"])
+        entity, name = await _peer_out(client, payload["peer"])
         if action == "send":
             sent = await client.send_message(entity, payload["message"])
             return {"sentId": int(sent.id), "peer": name}
@@ -677,7 +680,7 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
 
     # Read back the exact resulting state; the RPC return is not proof.
     async def _verify(client: Any) -> dict[str, Any]:
-        entity, name = _peer_out(client, payload["peer"])
+        entity, name = await _peer_out(client, payload["peer"])
         if action in {"send", "reply"}:
             message = await client.get_messages(entity, ids=outcome["sentId"])
             if message is None or (message.message or "") != payload["message"]:
