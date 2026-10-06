@@ -10,9 +10,11 @@ profile's Hermes home; this module never copies or persists credentials.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import re
 import secrets
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -29,12 +31,24 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 router = APIRouter()
 
 # Standalone auth client (QR / phone code / 2FA) — its own session file.
-try:  # pragma: no cover - dashboard imports both files from one directory
-    from plugin_auth import router as _auth_router
+# The dashboard server imports this file by path without putting this
+# directory on sys.path, so load plugin_auth explicitly from this directory.
+def _mount_auth_router() -> None:
+    auth_path = Path(__file__).resolve().parent / "plugin_auth.py"
+    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_telegram_auth", auth_path)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # auth stays unavailable; /status keeps working
+        sys.modules.pop(spec.name, None)
+        return
+    router.include_router(module.router)
 
-    router.include_router(_auth_router)
-except Exception:  # the auth module is optional at import time
-    pass
+
+_mount_auth_router()
 
 _TELETHON_TIMEOUT_SECONDS = 20.0
 _TICKET_TTL_SECONDS = 300.0
