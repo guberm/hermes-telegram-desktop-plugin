@@ -362,6 +362,7 @@ export function TelegramPage({ ctx }) {
 }
 
 const ID = 'telegram'
+let mountId = 0
 export default {
   id: ID, name: 'Telegram',
   register(ctx) {

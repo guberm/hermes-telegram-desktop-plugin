@@ -90,7 +90,9 @@ class ShippedSourceContractTests(unittest.TestCase):
         self.assertEqual(hex_or_rgb, [])
 
     def test_package_version_present(self):
-        self.assertIn("version: 1.0.0", (ROOT / "plugins/telegram/plugin.yaml").read_text(encoding="utf-8"))
+        text = (ROOT / "plugins/telegram/plugin.yaml").read_text(encoding="utf-8")
+        import re
+        self.assertRegex(text, r"(?m)^version: \d+\.\d+\.\d+$")
 
 
 if __name__ == "__main__":

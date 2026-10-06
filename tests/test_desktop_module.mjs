@@ -15,6 +15,15 @@ test('Telegram Desktop source parses as an ES module', () => {
   assert.equal(result.status, 0, result.stderr || result.stdout)
 })
 
+test('every referenced module-level helper is declared', () => {
+  // Regression: mountId was used by useState initializers but never declared,
+  // which only surfaced as a runtime ReferenceError on page mount.
+  assert.match(source, /(?:^|\n)(?:let|const|var)\s+mountId\b/)
+  for (const name of ['stack', 'row', 'text', 'muted', 'DEFAULT_SETTINGS', 'ID']) {
+    assert.match(source, new RegExp(`(?:^|\\n)(?:let|const|var)\\s+${name}\\b`), name)
+  }
+})
+
 function loadFunction(name, nextName, prefix = '') {
   const start = source.indexOf(`export function ${name}(`)
   assert.notEqual(start, -1, `${name} is present`)
