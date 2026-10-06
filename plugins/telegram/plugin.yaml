@@ -1,5 +1,5 @@
 name: telegram
-version: 1.0.2
+version: 1.0.3
 description: Telegram client pane for Hermes Desktop - dialogs, message history, topic browsing, and reviewed send/reply/delete/mark-read actions via the connected Telethon user session.
 manifest_version: 1
 kind: standalone

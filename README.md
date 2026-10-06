@@ -20,9 +20,17 @@ OAuth-секретов, api_id/api_hash или файлов сессии — bac
    profile-локально под `~/.hermes/profiles/<name>/plugins/telegram/`).
 2. Добавить `telegram` в `plugins.enabled` активного профиля (trust gate
    для dashboard backend, отдельный от переключателя в Desktop UI).
-3. Desktop сам materializes `desktop/plugin.js` в `~/.hermes/desktop-plugins/telegram/`
+3. **Runtime-зависимость**: desktop/dashboard-бэкенд Hermes исполняет
+   `plugin_api.py` в своём pm-окружении (например
+   `~/.hermes/installs/<id>/environments/<env>/venv`). Telethon должен быть
+   установлен именно туда, иначе роуты смонтируются, но каждый запрос вернёт
+   502 «backend unavailable»:
+   ```
+   uv pip install --python ~/.hermes/installs/<id>/environments/<env>/venv/bin/python telethon
+   ```
+4. Desktop сам materializes `desktop/plugin.js` в `~/.hermes/desktop-plugins/telegram/`
    при старте — вручную копировать не нужно.
-4. Перезапустить/перечитать плагины: ⌘K → **Reload desktop plugins**;
+5. Перезапустить/перечитать плагины: ⌘K → **Reload desktop plugins**;
    в боковой панели появится строка **Telegram**, маршрут `/telegram`.
 
 Сессия берётся из `~/.hermes/rss_reader/config.json` активного профиля
