@@ -55,6 +55,149 @@ function Field({ label, value, onChange, multiline = false, ...props }) {
   ] })
 }
 
+// --- Login panel -------------------------------------------------------------
+// Rendered whenever the backend reports an unauthorized dedicated session.
+// Talks to the standalone /auth/* endpoints (own TelegramClient + session).
+
+// The desktop bundles 'qrcode' (same pattern as app/messaging/telegram-qr-setup);
+// render to a data URL so no canvas plumbing is needed.
+export async function renderLoginQr(payload) {
+  const QRCode = await import('qrcode')
+  return QRCode.toDataURL(payload, { errorCorrectionLevel: 'M', margin: 1, width: 224 })
+}
+
+function QrImage({ tokenB64 }) {
+  const [dataUrl, setDataUrl] = useState('')
+  useEffect(() => {
+    let cancelled = false
+    if (!tokenB64) { setDataUrl(''); return }
+    void renderLoginQr(`tg://login?token=${tokenB64}`)
+      .then(url => { if (!cancelled) setDataUrl(url) })
+      .catch(() => { if (!cancelled) setDataUrl('') })
+    return () => { cancelled = true }
+  }, [tokenB64])
+  if (!tokenB64 || !dataUrl) return null
+  return jsx('img', {
+    alt: 'Telegram login QR code', src: dataUrl,
+    style: { width: '224px', height: '224px', borderRadius: '0.4rem', padding: '0.5rem', background: 'var(--ui-bg-primary)', border: '1px solid var(--ui-stroke-secondary)' },
+  })
+}
+
+export function AuthPanel({ ctx, onAuthorized }) {
+  const [mode, setMode] = useState('choose') // choose | phone | qr
+  const [stage, setStage] = useState('idle') // backend auth stage
+  const [phone, setPhone] = useState('')
+  const [code, setCode] = useState('')
+  const [password, setPassword] = useState('')
+  const [qrToken, setQrToken] = useState('')
+  const [me, setMe] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const live = useRef({})
+  live.current = { mode, phone, code, password }
+
+  useEffect(() => {
+    let disposed = false
+    if (mode !== 'qr') return
+    const poll = async () => {
+      while (!disposed) {
+        try {
+          const state = await ctx.rest('/auth/qr-poll', { timeoutMs: 30000 })
+          if (disposed) return
+          if (state?.stage === 'done') {
+            setStage('done'); setMe(state.me || ''); onAuthorized?.(); return
+          }
+          if (state?.qrToken) setQrToken(state.qrToken)
+        } catch { /* transient; keep polling */ }
+        await new Promise(resolve => setTimeout(resolve, 2500))
+      }
+    }
+    void poll()
+    return () => { disposed = true }
+  }, [ctx, mode, onAuthorized])
+
+  async function startPhone() {
+    setBusy(true); setError('')
+    try {
+      const result = await ctx.rest('/auth/start-phone', { method: 'POST', body: { phone: phone.trim() }, timeoutMs: 40000 })
+      setStage(result?.stage || 'sent-code')
+      if (result?.stage === 'done') { setMe(result.me || ''); onAuthorized?.() }
+    } catch (e) { setError(e?.message || String(e)) } finally { setBusy(false) }
+  }
+  async function submitCode() {
+    setBusy(true); setError('')
+    try {
+      const result = await ctx.rest('/auth/submit-code', { method: 'POST', body: { code: code.trim() }, timeoutMs: 40000 })
+      setStage(result?.stage || 'idle')
+      if (result?.stage === 'done') { setMe(result.me || ''); onAuthorized?.() }
+    } catch (e) { setError(e?.message || String(e)) } finally { setBusy(false) }
+  }
+  async function submitPassword() {
+    setBusy(true); setError('')
+    try {
+      const result = await ctx.rest('/auth/submit-password', { method: 'POST', body: { password }, timeoutMs: 40000 })
+      setStage(result?.stage || 'idle')
+      if (result?.stage === 'done') { setMe(result.me || ''); onAuthorized?.() }
+    } catch (e) { setError(e?.message || String(e)) } finally { setBusy(false) }
+  }
+  async function startQr() {
+    setBusy(true); setError('')
+    try {
+      const result = await ctx.rest('/auth/qr-start', { method: 'POST', timeoutMs: 40000 })
+      setQrToken(result?.qrToken || '')
+      setStage(result?.stage || 'qr-pending')
+    } catch (e) { setError(e?.message || String(e)) } finally { setBusy(false) }
+  }
+  async function cancel() {
+    setBusy(true)
+    try { await ctx.rest('/auth/cancel', { method: 'POST', timeoutMs: 30000 }) } catch { /* ignore */ }
+    setMode('choose'); setStage('idle'); setCode(''); setPassword(''); setQrToken(''); setError('')
+    setBusy(false)
+  }
+
+  return jsxs('section', { 'aria-label': 'Telegram login', style: {
+    ...stack, border: '1px solid var(--ui-stroke-secondary)', borderRadius: '0.5rem', padding: '0.75rem',
+  }, children: [
+    jsxs('div', { style: { ...row, justifyContent: 'space-between' }, children: [
+      jsx('strong', { children: 'Sign in to Telegram' }),
+      mode !== 'choose' && action('Back', () => { void cancel() }, busy),
+    ] }),
+    note('The plugin uses its own Telegram session, separate from other Hermes integrations. Codes and passwords are never stored; only this plugin\'s session file is kept.'),
+    error && note(error, true),
+    mode === 'choose' && jsxs('div', { style: row, children: [
+      action('Login with phone', () => setMode('phone'), busy),
+      action('Login with QR', () => { setMode('qr'); void startQr() }, busy),
+    ] }),
+    mode === 'phone' && jsxs('div', { style: stack, children: [
+      stage === 'idle' && jsxs('div', { style: stack, children: [
+        jsx(Field, { label: 'Phone (+15551234567)', value: phone, onChange: setPhone, disabled: busy }),
+        action(stage === 'idle' ? 'Send code' : 'Sending…', () => { void startPhone() }, busy || phone.trim().length < 6),
+      ] }),
+      stage === 'sent-code' && jsxs('div', { style: stack, children: [
+        note(`Code sent to ${phone}. Enter it below (check Telegram app or SMS).`),
+        jsx(Field, { label: 'Login code', value: code, onChange: setCode, disabled: busy }),
+        action('Verify code', () => { void submitCode() }, busy || code.trim().length < 4),
+      ] }),
+      stage === 'password' && jsxs('div', { style: stack, children: [
+        note('Two-factor authentication is enabled. Enter your Telegram password (used once, never stored).'),
+        jsx(Field, { label: '2FA password', value: password, onChange: setPassword, disabled: busy, type: 'password' }),
+        action('Sign in', () => { void submitPassword() }, busy || !password),
+      ] }),
+      stage === 'done' && jsx('div', { children: note(`Signed in${me ? ` as ${me}` : ''}.`) }),
+    ] }),
+    mode === 'qr' && jsxs('div', { style: stack, children: [
+      stage === 'done'
+        ? jsx('div', { children: note(`Signed in${me ? ` as ${me}` : ''}.`) })
+        : jsxs('div', { style: stack, children: [
+            note('Open Telegram → Settings → Devices → Link Desktop Device, and scan this code.'),
+            jsx(QrImage, { tokenB64: qrToken }),
+            !qrToken && !busy && note('Generating QR…', true),
+            busy && note('Working…'),
+          ] }),
+    ] }),
+  ] })
+}
+
 // Render backend-sanitized Telegram HTML preview through React elements only.
 // The markup arrives only from the backend's Python HTMLParser sanitizer
 // (allowlisted tags, escaped text, https-only hrefs) and is parsed here in a
@@ -427,17 +570,22 @@ function Connected({ ctx, profile }) {
   const retryButton = useRef(null)
   const prefix = [ID, instance]
   const status = useQuery({ queryKey: [...prefix, 'status'], queryFn: () => ctx.rest('/status', { timeoutMs: 20000 }), refetchInterval: 30000, retry: false })
+  // The dedicated session exists but is not logged in yet: /status answers 503
+  // "not authorized". Show the standalone login panel; hide it once authorized.
+  const needsLogin = status.isError && /authoriz/i.test(String(status.error?.message || '') + String(status.error?.body || ''))
+  const [loginNonce, setLoginNonce] = useState(0)
   return jsxs('main', { style: { ...stack, height: '100%', overflow: 'auto', padding: '1rem', color: 'var(--ui-text-primary)' }, children: [
     jsx('h1', { children: 'Telegram' }),
     note('Read dialogs and history as reference. Every send, reply, delete, or mark-read requires review and backend confirmation.'),
     status.isPending && note('Connecting to the current Telegram backend…'),
     status.isError && jsxs('div', { children: [
-      note(status.data
-        ? 'Telegram status read failed. The pane is hidden until the session is rechecked.'
+      note(needsLogin
+        ? 'The plugin\'s own Telegram session is not signed in yet. Use the login panel below.'
         : 'Telegram backend unavailable. Enable the reviewed backend for this profile (plugins.enabled) and keep the Telethon session configured. No setup runs automatically.', true),
       action('Retry connection', () => status.refetch(), status.isFetching, { ref: retryButton })
     ] }),
-    status.data && jsx(TelegramPane, { ctx, identity: status.data, profile, queryPrefix: prefix, statusUnavailable: status.isError, retryButton },
+    status.isError && jsx(AuthPanel, { ctx, onAuthorized: () => setLoginNonce(n => n + 1) }, `login:${loginNonce}`),
+    !status.isError && status.data && jsx(TelegramPane, { ctx, identity: status.data, profile, queryPrefix: prefix, statusUnavailable: status.isError, retryButton },
       JSON.stringify([status.data.scope, status.data.me]))
   ] })
 }
