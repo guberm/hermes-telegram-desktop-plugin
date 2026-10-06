@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import test from 'node:test'
+import vm from 'node:vm'
 
 const source = readFileSync(new URL('../plugins/telegram/desktop/plugin.js', import.meta.url), 'utf8')
 
@@ -13,6 +14,37 @@ test('Telegram Desktop source parses as an ES module', () => {
     input: source
   })
   assert.equal(result.status, 0, result.stderr || result.stdout)
+})
+
+test('auth UI uses only approved runtime imports and reaches the auth endpoints', () => {
+  // Runtime-loader rejects any package import beyond SDK/react; QR core must
+  // be bundled inline rather than imported as a bare package.
+  assert.doesNotMatch(source, /import\s*\(\s*['"]qrcode['"]\s*\)/)
+  assert.match(source, /export function AuthPanel\(/)
+  for (const endpoint of ['/auth/start-phone', '/auth/submit-code', '/auth/submit-password', '/auth/qr-start', '/auth/qr-poll']) {
+    assert.ok(source.includes(endpoint), `AuthPanel wires ${endpoint}`)
+  }
+  assert.match(source, /Sign in to Telegram/)
+  assert.match(source, /invalidateQueries\(\{ queryKey: \[\.\.\.prefix, 'status'\]/)
+})
+
+test('bundled login QR encoder returns a structurally valid matrix', () => {
+  const start = source.indexOf('var QRCore=(()=>')
+  const end = source.indexOf('\nfunction QrImage(', start)
+  assert.ok(start > 0 && end > start, 'inline QR core and render wrapper are present')
+  const code = source.slice(start, end)
+    .replace('export function renderLoginQr', 'function renderLoginQr') +
+    '\nglobalThis.renderLoginQr = renderLoginQr'
+  const context = { TextEncoder }
+  vm.runInNewContext(code, context)
+  const matrix = context.renderLoginQr('tg://login?token=unit-test-token-1234567890')
+  assert.ok(Array.isArray(matrix))
+  assert.ok(matrix.length >= 21 && matrix.length <= 177 && matrix.length % 4 === 1)
+  assert.ok(matrix.every(row => Array.isArray(row) && row.length === matrix.length && row.every(x => typeof x === 'boolean')))
+  // Top-left finder pattern and its central 3x3 block are preserved.
+  assert.equal(matrix[0][0], true)
+  assert.equal(matrix[1][1], false)
+  assert.equal(matrix[3][3], true)
 })
 
 test('every referenced module-level helper is declared', () => {

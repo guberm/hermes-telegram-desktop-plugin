@@ -33,6 +33,12 @@ OAuth-секретов, api_id/api_hash или файлов сессии — bac
 5. Перезапустить/перечитать плагины: ⌘K → **Reload desktop plugins**;
    в боковой панели появится строка **Telegram**, маршрут `/telegram`.
 
+При неавторизованной отдельной сессии в самой странице отображается login panel:
+вход телефоном (код, затем при наличии 2FA-пароль) или QR. QR-кодер включён
+в `desktop/plugin.js` inline, потому что Desktop runtime разрешает импорты только
+`@hermes/plugin-sdk` и `react`. Embedded encoder — `qrcode@1.5.4` (MIT), текст
+лицензии: `LICENSES/qrcode-MIT.txt`.
+
 `api_id` и `api_hash` берутся из `~/.hermes/rss_reader/config.json` активного
 профиля; `session_path` из этого файла не используется. Login flow и все
 plugin API calls используют только выделенную сессию

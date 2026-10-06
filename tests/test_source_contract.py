@@ -93,11 +93,16 @@ class ShippedSourceContractTests(unittest.TestCase):
 
     def test_no_hardcoded_colors_in_frontend(self):
         import re
-        # Theme variables only. The single allowed literal is the badge text
-        # color fallback inside a var() fallback position.
-        code = re.sub(r"var\([^)]*\)", "", self.plugin_text)
-        hex_or_rgb = re.findall(r"(#(?:[0-9a-fA-F]{3,6})\b|rgb\()", code)
-        self.assertEqual(hex_or_rgb, [])
+        # Normal UI must use theme variables. The QR bitmap is intentionally
+        # monochrome for scanner contrast; permit only pure black/white there.
+        qr_start = self.plugin_text.index("function QrImage(")
+        qr_end = self.plugin_text.index("export function AuthPanel(", qr_start)
+        qr_code = self.plugin_text[qr_start:qr_end]
+        ui_code = self.plugin_text[:qr_start] + self.plugin_text[qr_end:]
+        ui_code = re.sub(r"var\([^)]*\)", "", ui_code)
+        self.assertEqual(re.findall(r"(#(?:[0-9a-fA-F]{3,6})\b|rgb\()", ui_code), [])
+        qr_colors = set(re.findall(r"#(?:[0-9a-fA-F]{3,6})\b", qr_code))
+        self.assertEqual(qr_colors, {"#ffffff", "#000000"})
 
     def test_package_version_present(self):
         text = (ROOT / "plugins/telegram/plugin.yaml").read_text(encoding="utf-8")
