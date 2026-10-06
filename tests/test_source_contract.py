@@ -33,9 +33,19 @@ class ShippedSourceContractTests(unittest.TestCase):
 
     def test_session_resolves_at_request_time_and_never_persists_secrets(self):
         self.assertIn('"rss_reader" / "config.json"', self.backend_text)
+        self.assertIn('"telegram-plugin-auth"', self.backend_text)
+        self.assertIn('str(_dedicated_session_path())', self.backend_text)
+        self.assertNotIn('config["session_path"]', self.backend_text)
         self.assertIn("get_hermes_home", self.backend_text)
         for forbidden in ("session_path.write", "json.dump", "to_json()"):
             self.assertNotIn(forbidden, self.backend_text)
+
+    def test_telegram_filters_and_desktop_badge_tokens_are_shipped(self):
+        self.assertIn("GetDialogFiltersRequest", self.backend_text)
+        self.assertIn('"folderIds"', self.backend_text)
+        self.assertIn("var(--dt-primary-solid)", self.plugin_text)
+        self.assertIn("var(--dt-primary-solid-foreground)", self.plugin_text)
+        self.assertNotIn("--ui-accent-foreground", self.plugin_text)
 
     def test_prepare_commit_pipeline_is_present(self):
         self.assertIn('action: Literal["send"]', self.backend_text)

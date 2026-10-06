@@ -33,20 +33,20 @@ function loadFunction(name, nextName, prefix = '') {
   return Function(`${prefix}\n${fn}\nreturn ${name}`)()
 }
 
-const defaults = 'const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, tab: \'all\' })\nconst settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`'
+const defaults = 'const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: \'all\' })\nconst settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`'
 
 test('settings default to manual refresh', () => {
   const load = loadFunction('loadSettings', 'unreadBadge', defaults)
-  assert.deepEqual(load({ get: () => null }, 'k'), { autoRefresh: false, unmutedOnly: false, tab: 'all' })
-  assert.deepEqual(load({ get: () => ({ autoRefresh: true, unmutedOnly: true, tab: 'unread', junk: 1 }) }, 'k'),
-    { autoRefresh: true, unmutedOnly: true, tab: 'unread' })
+  assert.deepEqual(load({ get: () => null }, 'k'), { autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: 'all' })
+  assert.deepEqual(load({ get: () => ({ autoRefresh: true, unmutedOnly: true, unreadOnly: true, tab: '42', junk: 1 }) }, 'k'),
+    { autoRefresh: true, unmutedOnly: true, unreadOnly: true, tab: '42' })
   assert.deepEqual(load({ get: () => ({ autoRefresh: 'yes', tab: 'nope' }) }, 'k'),
-    { autoRefresh: false, unmutedOnly: false, tab: 'all' })
+    { autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: 'all' })
   assert.deepEqual(load({ get: () => { throw new Error('storage locked') } }, 'k'),
-    { autoRefresh: false, unmutedOnly: false, tab: 'all' })
+    { autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: 'all' })
 })
 
-test('unread badge is high-contrast and mutes aware', () => {
+test('unread badge uses the verified Desktop contrast tokens and readable counts', () => {
   const start = source.indexOf('export function unreadBadge(')
   const end = source.indexOf('\nexport function filterDialogs(')
   const fn = source.slice(start, end).replace('export function unreadBadge', 'function unreadBadge')
@@ -59,28 +59,35 @@ test('unread badge is high-contrast and mutes aware', () => {
   assert.equal(hot.props['aria-label'], '5 unread', hot.props['aria-label'])
   assert.equal(hot.props.children, '5')
   const hotStyle = hot.props.style
-  assert.match(hotStyle.background, /var\(--ui-accent\)$/)
-  assert.equal(hotStyle.color.startsWith('var('), true, hotStyle.color)
+  assert.equal(hotStyle.background, 'var(--dt-primary-solid)')
+  assert.equal(hotStyle.color, 'var(--dt-primary-solid-foreground)')
+  assert.equal(hotStyle.color.includes('--ui-accent-foreground'), false)
   assert.equal(hotStyle.border, undefined)
   const mutedPill = badge(7865, true)
   assert.match(mutedPill.props.style.border, /1px solid/)
   assert.equal(mutedPill.props.children, '99+') // 7865 -> 99+
   const small = badge(3, true)
   assert.equal(small.props.children, '3')
+  assert.equal(badge(1, false).props.children, '1')
+  assert.equal(badge(100, false).props.children, '99+')
 })
 
-test('dialog tabs and unmuted-only filter like the native client', () => {
+test('dialog tabs filter by backend-returned stable folder IDs', () => {
   const filter = loadFunction('filterDialogs', 'Confirmation')
   const rows = [
-    { key: '@a', unread: 0, muted: false },
-    { key: '@b', unread: 4, muted: false },
-    { key: '@c', unread: 9, muted: true },
-    { key: '@d', unread: 2, muted: true },
+    { key: '@a', unread: 0, muted: false, folderIds: ['all', '7'] },
+    { key: '@b', unread: 4, muted: false, folderIds: ['all', '8', 'unread'] },
+    { key: '@c', unread: 9, muted: true, folderIds: ['all', 'unread'] },
+    { key: '@d', unread: 2, muted: true, folderIds: ['archive', 'unread'] },
   ]
-  assert.equal(filter(rows, 'all', false).length, 4)
+  assert.equal(filter(rows, 'all', false).length, 3)
+  assert.deepEqual(filter(rows, 'all', false, true).map(d => d.key), ['@b', '@c'])
   assert.deepEqual(filter(rows, 'unread', false).map(d => d.key), ['@b', '@c', '@d'])
+  assert.deepEqual(filter(rows, '7', false).map(d => d.key), ['@a'])
+  assert.deepEqual(filter(rows, '8', false).map(d => d.key), ['@b'])
+  assert.deepEqual(filter(rows, 'archive', false).map(d => d.key), ['@d'])
   assert.deepEqual(filter(rows, 'all', true).map(d => d.key), ['@a', '@b'])
-  assert.deepEqual(filter(rows, 'unread', true).map(d => d.key), ['@b'])
+  assert.deepEqual(filter(rows, 'all', true, true).map(d => d.key), ['@b'])
   assert.equal(filter(null, 'all', false).length, 0)
   assert.equal(filter([null, false, 'x'], 'all', false).length, 0)
 })

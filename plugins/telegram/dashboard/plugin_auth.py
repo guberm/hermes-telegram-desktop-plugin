@@ -43,6 +43,8 @@ router = APIRouter()
 
 _AUTH_TIMEOUT_SECONDS = 25.0
 _LOCK = threading.RLock()
+_VOLATILE_STATE: dict[str, Any] = {}
+_TRANSIENT_AUTH_FIELDS = {"phoneCodeHash", "qr_token_b64", "qr_started"}
 
 _PHONE_RE_OK = r"^\+?[0-9]{5,20}$"
 _CODE_RE_OK = r"^[0-9]{4,8}$"
@@ -169,12 +171,11 @@ class _AuthFlowError(RuntimeError):
 
 
 def _api_credentials() -> tuple[int, str]:
-    """Resolve api_id/api_hash at call time from the profile config."""
+    """Resolve API credentials without depending on an RSS session_path."""
 
     import plugin_api as _api
 
-    config = _api._load_telegram_config()
-    return int(config["api_id"]), str(config["api_hash"])
+    return _api._load_telegram_credentials()
 
 
 _API_CREDENTIALS: tuple[int, str] | None = None
@@ -197,12 +198,18 @@ def _auth_dir() -> Path:
     from hermes_constants import get_hermes_home
 
     path = Path(get_hermes_home()) / "telegram-plugin-auth"
-    path.mkdir(parents=True, exist_ok=True)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
     return path
 
 
 def _session_path() -> Path:
-    return _auth_dir() / "telegram-plugin-auth"
+    import plugin_api as _api
+
+    return _api._dedicated_session_path()
 
 
 def _state_path() -> Path:
@@ -210,18 +217,47 @@ def _state_path() -> Path:
 
 
 def _read_state() -> dict[str, Any]:
+    global _VOLATILE_STATE
     path = _state_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {"stage": "idle"}
+        if not isinstance(data, dict):
+            data = {"stage": "idle"}
     except Exception:
-        return {"stage": "idle"}
+        data = {"stage": "idle"}
+    stale_fields = _TRANSIENT_AUTH_FIELDS.intersection(data)
+    if stale_fields:
+        # Scrub challenge bearer material left by older plugin versions.
+        data = {key: value for key, value in data.items() if key not in _TRANSIENT_AUTH_FIELDS}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    if data.get("stage") in {"sent-code", "qr-pending"} and not _VOLATILE_STATE:
+        # Challenge state cannot safely survive a process restart without its
+        # in-memory token; require a new, explicit auth start.
+        data = {"stage": "idle"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+    return {**data, **_VOLATILE_STATE}
 
 
 def _write_state(state: dict[str, Any]) -> None:
-    # Never persist phone codes or passwords here; only stage + identifiers.
-    safe = {k: v for k, v in state.items() if k not in {"code", "password"}}
-    _state_path().write_text(json.dumps(safe), encoding="utf-8")
+    # OTP/password and Telegram's pending code hash/QR bearer token are never
+    # persisted. Keep only the transient challenge material in process memory.
+    global _VOLATILE_STATE
+    _VOLATILE_STATE = (
+        {k: v for k, v in state.items() if k in _TRANSIENT_AUTH_FIELDS}
+        if state.get("stage") in {"sent-code", "qr-pending"}
+        else {}
+    )
+    safe = {k: v for k, v in state.items() if k not in {"code", "password", *_TRANSIENT_AUTH_FIELDS}}
+    path = _state_path()
+    path.write_text(json.dumps(safe), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def _run(coro: Any) -> Any:
@@ -233,11 +269,11 @@ def _new_client() -> Any:
 
     import plugin_api as _api
 
-    config = _api._load_telegram_config()
+    api_id, api_hash = _api._load_telegram_credentials()
     return TelegramClient(
-        str(_session_path()),
-        int(config["api_id"]),
-        str(config["api_hash"]),
+        str(_api._dedicated_session_path()),
+        api_id,
+        api_hash,
         receive_updates=False,
     )
 

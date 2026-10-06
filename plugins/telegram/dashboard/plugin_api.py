@@ -17,6 +17,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from html import escape, unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -231,33 +232,47 @@ def _current_home() -> str:
     return str(Path(get_hermes_home()).expanduser().resolve(strict=False))
 
 
-def _load_telegram_config() -> dict[str, Any]:
+def _load_telegram_credentials() -> tuple[int, str]:
+    """Resolve API credentials without requiring or reading an RSS session path."""
+
     path = Path(_current_home()) / "rss_reader" / "config.json"
     if not path.is_file():
-        raise _AuthUnavailable("missing Telegram session configuration")
+        raise _AuthUnavailable("missing Telegram API configuration")
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:  # pragma: no cover - defensive
-        raise _AuthUnavailable("invalid Telegram session configuration") from exc
+        raise _AuthUnavailable("invalid Telegram API configuration") from exc
     if not isinstance(config, dict):
-        raise _AuthUnavailable("invalid Telegram session configuration")
+        raise _AuthUnavailable("invalid Telegram API configuration")
     api_id = config.get("api_id")
     api_hash = config.get("api_hash")
-    session_path = config.get("session_path")
-    if not isinstance(api_id, int) or not api_hash or not isinstance(session_path, str) or not session_path:
-        raise _AuthUnavailable("incomplete Telegram session configuration")
-    return {"api_id": api_id, "api_hash": str(api_hash), "session_path": session_path}
+    if not isinstance(api_id, int) or api_id <= 0 or not isinstance(api_hash, str) or not api_hash:
+        raise _AuthUnavailable("incomplete Telegram API configuration")
+    return api_id, api_hash
+
+
+def _dedicated_session_path() -> Path:
+    """Return the one session path shared by auth and all plugin API calls."""
+
+    from hermes_constants import get_hermes_home
+
+    directory = Path(get_hermes_home()).expanduser() / "telegram-plugin-auth"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    return directory / "telegram-plugin-auth"
 
 
 async def _with_client(handler: Callable[[Any], Any]) -> Any:
     from telethon import TelegramClient
 
-    config = _load_telegram_config()
-    session_path = Path(config["session_path"])
+    api_id, api_hash = _load_telegram_credentials()
     client = TelegramClient(
-        str(session_path),
-        config["api_id"],
-        config["api_hash"],
+        str(_dedicated_session_path()),
+        api_id,
+        api_hash,
         receive_updates=False,
     )
     await client.connect()
@@ -333,6 +348,152 @@ def _peer_key(entity: Any) -> str:
     except Exception:
         identifier = getattr(entity, "id", None)
         return f"id:{identifier}" if identifier is not None else ""
+
+
+def _peer_identity(entity: Any) -> int | None:
+    if entity is None:
+        return None
+    try:
+        from telethon import utils as tg_utils
+
+        return int(tg_utils.get_peer_id(entity))
+    except Exception:
+        identifier = getattr(entity, "id", None)
+        return int(identifier) if isinstance(identifier, int) else None
+
+
+def _dialog_is_muted(dialog: Any, now: float | None = None) -> bool:
+    settings = getattr(dialog, "notify_settings", None)
+    mute_until = getattr(settings, "mute_until", None) if settings is not None else None
+    if not mute_until:
+        return False
+    if isinstance(mute_until, datetime):
+        timestamp = mute_until.replace(tzinfo=mute_until.tzinfo or timezone.utc).timestamp()
+    else:
+        try:
+            timestamp = float(mute_until)
+        except (TypeError, ValueError):
+            return False
+    return timestamp > (time.time() if now is None else now)
+
+
+def _dialog_is_group(entity: Any) -> bool:
+    name = type(entity).__name__
+    return name == "Chat" or bool(getattr(entity, "megagroup", False))
+
+
+def _filter_membership(dialog: Any, definition: Any) -> tuple[bool, bool]:
+    """Return (matches, pinned) for standard Telegram smart/chatlist filters."""
+
+    entity = getattr(dialog, "entity", None)
+    identity = _peer_identity(entity)
+    includes = list(getattr(definition, "include_peers", None) or [])
+    excludes = list(getattr(definition, "exclude_peers", None) or [])
+    pinned = list(getattr(definition, "pinned_peers", None) or [])
+    include_ids = {peer_id for peer_id in (_peer_identity(peer) for peer in includes) if peer_id is not None}
+    exclude_ids = {peer_id for peer_id in (_peer_identity(peer) for peer in excludes) if peer_id is not None}
+    pinned_ids = {peer_id for peer_id in (_peer_identity(peer) for peer in pinned) if peer_id is not None}
+    if identity is None or identity in exclude_ids:
+        return False, False
+
+    is_pinned = identity in pinned_ids
+    if type(definition).__name__ == "DialogFilterChatlist":
+        matches = identity in include_ids or is_pinned
+    else:
+        entity_is_user = type(entity).__name__ == "User" or hasattr(entity, "first_name")
+        category_match = False
+        if entity_is_user:
+            is_bot = bool(getattr(entity, "bot", False))
+            is_contact = bool(getattr(entity, "contact", False) or getattr(entity, "mutual_contact", False))
+            category_match = (
+                (bool(getattr(definition, "bots", False)) and is_bot)
+                or (bool(getattr(definition, "contacts", False)) and is_contact and not is_bot)
+                or (bool(getattr(definition, "non_contacts", False)) and not is_contact and not is_bot)
+            )
+        elif _dialog_is_group(entity):
+            category_match = bool(getattr(definition, "groups", False))
+        elif bool(getattr(entity, "broadcast", False)):
+            category_match = bool(getattr(definition, "broadcasts", False))
+
+        matches = identity in include_ids or is_pinned or category_match
+
+    if not matches:
+        return False, is_pinned
+    if bool(getattr(definition, "exclude_muted", False)) and _dialog_is_muted(dialog):
+        return False, is_pinned
+    if bool(getattr(definition, "exclude_read", False)) and int(getattr(dialog, "unread_count", 0) or 0) <= 0:
+        return False, is_pinned
+    folder_id = getattr(dialog, "folder_id", None)
+    if bool(getattr(definition, "exclude_archived", False)) and folder_id == 1:
+        return False, is_pinned
+    return True, is_pinned
+
+
+def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Attach backend-computed memberships to dialogs and return stable tabs."""
+
+    folders: list[dict[str, Any]] = [{"id": "all", "title": "All", "kind": "all"}]
+    custom: list[tuple[str, Any]] = []
+    for definition in telegram_filters:
+        name = type(definition).__name__
+        if name == "DialogFilterDefault":
+            continue
+        ident = getattr(definition, "id", None)
+        title_obj = getattr(definition, "title", None)
+        title = getattr(title_obj, "text", None) or ""
+        if not isinstance(ident, int) or not title:
+            continue
+        kind = "chatlist" if name == "DialogFilterChatlist" else "telegram"
+        folders.append({"id": str(ident), "title": str(title), "kind": kind})
+        custom.append((str(ident), definition))
+
+    folders.append({"id": "archive", "title": "Archive", "kind": "archive"})
+
+    rows: list[dict[str, Any]] = []
+    for dialog in dialogs:
+        entity = getattr(dialog, "entity", None)
+        unread = int(getattr(dialog, "unread_count", 0) or 0)
+        raw_folder = getattr(dialog, "folder_id", None)
+        archived = raw_folder == 1
+        folder_ids = ["archive" if archived else "all"]
+        folder_pins: list[str] = []
+        for ident, definition in custom:
+            matches, pinned = _filter_membership(dialog, definition)
+            if matches:
+                folder_ids.append(ident)
+                if pinned:
+                    folder_pins.append(ident)
+        rows.append({
+            "key": _peer_key(entity),
+            "name": _peer_display_name(entity),
+            "unread": unread,
+            "muted": _dialog_is_muted(dialog),
+            "folder": int(raw_folder) if raw_folder is not None else 0,
+            "folderIds": folder_ids,
+            "folderPins": folder_pins,
+            "kind": entity.__class__.__name__ if entity is not None else "",
+            "lastMessageDate": dialog.date.isoformat() if getattr(dialog, "date", None) else "",
+        })
+    return folders, rows
+
+
+def _dialog_page(data: dict[str, Any], requested_folder: str, limit: int, unread_only: bool = False) -> dict[str, Any]:
+    folders = list(data.get("folders") or [])
+    valid_ids = {str(folder.get("id")) for folder in folders if isinstance(folder, dict)}
+    selected = requested_folder if requested_folder in valid_ids else "all"
+    rows: list[dict[str, Any]] = []
+    for dialog in data.get("dialogs") or []:
+        if not isinstance(dialog, dict):
+            continue
+        if unread_only and int(dialog.get("unread", 0) or 0) <= 0:
+            continue
+        folder_ids = dialog.get("folderIds")
+        if isinstance(folder_ids, list) and selected in folder_ids:
+            rows.append(dialog)
+    rows.sort(key=lambda dialog: not (
+        isinstance(dialog.get("folderPins"), list) and selected in dialog["folderPins"]
+    ))
+    return {"dialogs": rows[:limit], "folders": folders, "activeFolder": selected}
 
 
 def _clean_provider_text(value: Any, limit: int = _MAX_PROVIDER_TEXT) -> str:
@@ -492,37 +653,40 @@ def status(request: Request) -> dict[str, str]:
 
 
 @router.get("/dialogs")
-def dialogs(request: Request, scope: ScopeText, limit: Annotated[int, Query(ge=1, le=50)] = 20) -> dict[str, Any]:
-    _reject_query_extras(request, {"scope", "limit"})
+def dialogs(
+    request: Request,
+    scope: ScopeText,
+    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+    folder: Annotated[str, Query(max_length=64)] = "all",
+    unreadOnly: bool = False,
+) -> dict[str, Any]:
+    _reject_query_extras(request, {"scope", "limit", "folder", "unreadOnly"})
     binding = _binding(scope)
     me, _ = _provider_context(binding)
 
-    async def _collect(client: Any) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        async for dialog in client.iter_dialogs(limit=limit):
-            entity = dialog.entity
-            unread = int(getattr(dialog, "unread_count", 0) or 0)
-            notify = getattr(dialog, "notify_settings", None)
-            muted = bool(getattr(notify, "mute_until", None)) if notify is not None else False
-            folder = getattr(dialog, "folder_id", None)
-            result.append({
-                "key": _peer_key(entity),
-                "name": _peer_display_name(entity),
-                "unread": unread,
-                "muted": muted,
-                "folder": int(folder) if folder is not None else 0,
-                "kind": entity.__class__.__name__,
-                "lastMessageDate": dialog.date.isoformat() if getattr(dialog, "date", None) else "",
-            })
-        return result
+    async def _collect(client: Any) -> dict[str, Any]:
+        from telethon import functions
+        from telethon.tl.types import DialogFilter, DialogFilterChatlist
+
+        result: list[Any] = []
+        async for dialog in client.iter_dialogs():
+            result.append(dialog)
+        response = await client(functions.messages.GetDialogFiltersRequest())
+        telegram_filters = [
+            definition for definition in (getattr(response, "filters", None) or [])
+            if isinstance(definition, (DialogFilter, DialogFilterChatlist))
+        ]
+        folders, rows = _apply_dialog_filters(result, telegram_filters)
+        return {"dialogs": rows, "folders": folders}
 
     try:
-        items = _run_async(_with_client(_collect))
+        data = _run_async(_with_client(_collect))
     except _AuthUnavailable as exc:
         raise HTTPException(status_code=503, detail=f"Telegram backend unavailable: {exc}") from None
     except Exception:
         raise _provider_error() from None
-    return {"dialogs": items[:limit], "me": me}
+    page = _dialog_page(data, folder, limit, unread_only=unreadOnly)
+    return {**page, "me": me}
 
 
 @router.get("/messages")

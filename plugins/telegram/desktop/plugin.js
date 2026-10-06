@@ -110,7 +110,7 @@ export function contextText(me, message) {
     JSON.stringify({ source: 'telegram', me, ...message }, null, 2)
 }
 
-const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, tab: 'all' })
+const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: 'all' })
 const settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`
 export function loadSettings(storage, key) {
   try {
@@ -119,7 +119,8 @@ export function loadSettings(storage, key) {
     return {
       autoRefresh: raw.autoRefresh === true,
       unmutedOnly: raw.unmutedOnly === true,
-      tab: raw.tab === 'unread' ? 'unread' : 'all',
+      unreadOnly: raw.unreadOnly === true,
+      tab: typeof raw.tab === 'string' && /^(?:all|archive|\d{1,10})$/.test(raw.tab) ? raw.tab : 'all',
     }
   } catch { return { ...DEFAULT_SETTINGS } }
 }
@@ -137,7 +138,7 @@ export function unreadBadge(unread, muted) {
           fontWeight: 600, padding: '0.06rem 0.45rem', flexShrink: 0, fontVariantNumeric: 'tabular-nums',
         }
       : {
-          color: 'var(--ui-accent-foreground, var(--ui-bg-primary))', background: 'var(--ui-accent)',
+          color: 'var(--dt-primary-solid-foreground)', background: 'var(--dt-primary-solid)',
           borderRadius: '999px', fontSize: '0.72rem', fontWeight: 700,
           padding: '0.06rem 0.5rem', flexShrink: 0, fontVariantNumeric: 'tabular-nums',
         },
@@ -146,13 +147,17 @@ export function unreadBadge(unread, muted) {
 }
 
 // Filter dialogs the way the native client's tabs do.
-export function filterDialogs(dialogs, tab, unmutedOnly) {
+export function filterDialogs(dialogs, tab, unmutedOnly, unreadOnly = false) {
   const list = Array.isArray(dialogs) ? dialogs : []
   return list.filter(dialog => {
     if (!dialog || typeof dialog !== 'object') return false
     if (unmutedOnly && dialog.muted === true) return false
-    if (tab === 'unread' && !(dialog.unread > 0)) return false
-    return true
+    if (unreadOnly && !(dialog.unread > 0)) return false
+    return Array.isArray(dialog.folderIds) && dialog.folderIds.includes(tab)
+  }).sort((a, b) => {
+    const aPinned = Array.isArray(a.folderPins) && a.folderPins.includes(tab)
+    const bPinned = Array.isArray(b.folderPins) && b.folderPins.includes(tab)
+    return Number(bPinned) - Number(aPinned)
   })
 }
 
@@ -190,9 +195,11 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
   const queryPrefix = [...connectionPrefix, instance]
   const preferencesKey = settingsKey(profile, identity.me)
   const [settings, setSettings] = useState(() => loadSettings(ctx.storage, preferencesKey))
+  const [folder, setFolder] = useState(settings.tab)
+  const [unreadOnly, setUnreadOnly] = useState(settings.unreadOnly)
   useEffect(() => {
-    try { ctx.storage.set(preferencesKey, settings) } catch { /* keep for this visit */ }
-  }, [ctx, preferencesKey, settings])
+    try { ctx.storage.set(preferencesKey, { ...settings, tab: folder, unreadOnly }) } catch { /* keep for this visit */ }
+  }, [ctx, preferencesKey, settings, folder, unreadOnly])
   const [dialogKey, setDialogKey] = useState('')
   const [topicId, setTopicId] = useState(0)
   const [ticket, setTicket] = useState(null)
@@ -205,9 +212,16 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
   const scope = identity.scope
   const me = identity.me
 
-  const read = path => ctx.rest(path + (path.includes('?') ? '&' : '?') + new URLSearchParams({ scope }), { timeoutMs: 60000 })
+  const read = path => {
+    const params = { scope }
+    if (path.startsWith('/dialogs?')) {
+      params.folder = folder
+      params.unreadOnly = String(unreadOnly)
+    }
+    return ctx.rest(path + (path.includes('?') ? '&' : '?') + new URLSearchParams(params), { timeoutMs: 60000 })
+  }
   const dialogsQuery = useQuery({
-    queryKey: [...queryPrefix, scope, 'dialogs'],
+    queryKey: [...queryPrefix, scope, 'dialogs', folder, unreadOnly],
     queryFn: () => read('/dialogs?limit=40'),
     refetchInterval: settings.autoRefresh ? 60000 : false,
     enabled: !statusUnavailable,
@@ -270,34 +284,25 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
   }
 
   const waiting = busy || mutation.isPending
-  const visibleDialogs = filterDialogs(dialogsList, settings.tab, settings.unmutedOnly)
+  const folders = Array.isArray(dialogsQuery.data?.folders) ? dialogsQuery.data.folders : [{ id: 'all', title: 'All' }]
+  const selectedTab = folders.some(item => item.id === folder) ? folder : 'all'
+  const folderTabs = selectedTab === folder ? folders : [{ id: 'all', title: 'All' }, ...folders.filter(item => item.id !== 'all')]
+  const visibleDialogs = filterDialogs(dialogsList, selectedTab, settings.unmutedOnly)
 
-  const tabBar = jsxs('div', { role: 'tablist', 'aria-label': 'Dialog filters', style: { ...row, gap: '0.25rem' }, children: [
-    jsx('button', {
-      type: 'button', role: 'tab', 'aria-selected': settings.tab === 'all',
-      onClick: () => setSettings(current => ({ ...current, tab: 'all' })),
+  const tabBar = jsx('div', { role: 'tablist', 'aria-label': 'Telegram folders', style: { ...row, gap: '0.25rem', overflowX: 'auto', flexWrap: 'nowrap' }, children:
+    folderTabs.map(folder => jsx('button', {
+      type: 'button', role: 'tab', 'aria-selected': selectedTab === folder.id,
+      onClick: () => setFolder(folder.id),
       style: {
         border: 'none', cursor: 'pointer', font: 'inherit', padding: '0.25rem 0.7rem',
-        borderRadius: '999px',
-        background: settings.tab === 'all' ? 'var(--ui-accent)' : 'transparent',
-        color: settings.tab === 'all' ? 'var(--ui-accent-foreground, var(--ui-bg-primary))' : 'var(--ui-text-secondary)',
-        fontWeight: settings.tab === 'all' ? 700 : 500,
+        borderRadius: '999px', whiteSpace: 'nowrap',
+        background: selectedTab === folder.id ? 'var(--dt-primary-solid)' : 'transparent',
+        color: selectedTab === folder.id ? 'var(--dt-primary-solid-foreground)' : 'var(--ui-text-secondary)',
+        fontWeight: selectedTab === folder.id ? 700 : 500,
       },
-      children: 'All',
-    }),
-    jsx('button', {
-      type: 'button', role: 'tab', 'aria-selected': settings.tab === 'unread',
-      onClick: () => setSettings(current => ({ ...current, tab: 'unread' })),
-      style: {
-        border: 'none', cursor: 'pointer', font: 'inherit', padding: '0.25rem 0.7rem',
-        borderRadius: '999px',
-        background: settings.tab === 'unread' ? 'var(--ui-accent)' : 'transparent',
-        color: settings.tab === 'unread' ? 'var(--ui-accent-foreground, var(--ui-bg-primary))' : 'var(--ui-text-secondary)',
-        fontWeight: settings.tab === 'unread' ? 700 : 500,
-      },
-      children: 'Unread',
-    }),
-  ] })
+      children: folder.title,
+    }, folder.id))
+  })
 
   return jsxs('div', { style: { ...stack, height: '100%' }, children: [
     jsxs('div', { style: { ...row, justifyContent: 'space-between' }, children: [
@@ -305,13 +310,24 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
         jsx('strong', { children: `Telegram — ${me}` }),
         tabBar,
         jsx('button', {
+          type: 'button', role: 'switch', 'aria-checked': unreadOnly,
+          onClick: () => setUnreadOnly(value => !value),
+          style: {
+            border: '1px solid var(--ui-stroke-secondary)', cursor: 'pointer', font: 'inherit',
+            padding: '0.2rem 0.6rem', borderRadius: '0.4rem',
+            background: unreadOnly ? 'var(--dt-primary-solid)' : 'transparent',
+            color: unreadOnly ? 'var(--dt-primary-solid-foreground)' : 'var(--ui-text-secondary)',
+          },
+          children: unreadOnly ? 'Unread only ✓' : 'Unread only',
+        }),
+        jsx('button', {
           type: 'button', role: 'switch', 'aria-checked': settings.unmutedOnly,
           onClick: () => setSettings(current => ({ ...current, unmutedOnly: !current.unmutedOnly })),
           style: {
             border: '1px solid var(--ui-stroke-secondary)', cursor: 'pointer', font: 'inherit',
             padding: '0.2rem 0.6rem', borderRadius: '0.4rem',
-            background: settings.unmutedOnly ? 'var(--ui-accent)' : 'transparent',
-            color: settings.unmutedOnly ? 'var(--ui-accent-foreground, var(--ui-bg-primary))' : 'var(--ui-text-secondary)',
+            background: settings.unmutedOnly ? 'var(--dt-primary-solid)' : 'transparent',
+            color: settings.unmutedOnly ? 'var(--dt-primary-solid-foreground)' : 'var(--ui-text-secondary)',
           },
           children: settings.unmutedOnly ? '🔔 Unmuted only ✓' : '🔔 Unmuted only',
         }),

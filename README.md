@@ -33,9 +33,14 @@ OAuth-секретов, api_id/api_hash или файлов сессии — bac
 5. Перезапустить/перечитать плагины: ⌘K → **Reload desktop plugins**;
    в боковой панели появится строка **Telegram**, маршрут `/telegram`.
 
-Сессия берётся из `~/.hermes/rss_reader/config.json` активного профиля
-(`api_id`, `api_hash`, `session_path`), как в настроенном rss_reader/тг-боте.
-Backend держит refresh в памяти, ничего не пишет на диск и не копирует секреты.
+`api_id` и `api_hash` берутся из `~/.hermes/rss_reader/config.json` активного
+профиля; `session_path` из этого файла не используется. Login flow и все
+plugin API calls используют только выделенную сессию
+`~/.hermes/telegram-plugin-auth/telegram-plugin-auth.session`. Phone-code/QR
+challenge values держатся только в памяти процесса, а служебное состояние
+записывается с правами `0600`; успешная сессия остаётся в отдельном Telethon
+файле. Отсутствующая/неавторизованная выделенная сессия приводит к fail-closed
+ошибке, без fallback на RSS reader.
 
 ## Safety
 

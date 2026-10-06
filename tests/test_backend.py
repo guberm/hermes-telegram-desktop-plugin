@@ -7,10 +7,12 @@ validation, ticket staging, preview construction, and commit readback paths.
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import sys
+import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -22,6 +24,13 @@ SPEC = importlib.util.spec_from_file_location(MODULE_NAME, BACKEND)
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[MODULE_NAME] = MODULE
 SPEC.loader.exec_module(MODULE)
+sys.modules["plugin_api"] = MODULE
+AUTH_PATH = ROOT / "plugins/telegram/dashboard/plugin_auth.py"
+AUTH_SPEC = importlib.util.spec_from_file_location("plugin_auth", AUTH_PATH)
+assert AUTH_SPEC is not None and AUTH_SPEC.loader is not None
+AUTH = importlib.util.module_from_spec(AUTH_SPEC)
+sys.modules["plugin_auth"] = AUTH
+AUTH_SPEC.loader.exec_module(AUTH)
 
 
 def make_message(mid=101, text="hello world", mine=False, unread=True, reply_to=None):
@@ -74,6 +83,187 @@ class PeerKeyTests(unittest.TestCase):
 
     def test_display_name_prefers_title(self):
         self.assertEqual(MODULE._peer_display_name(SimpleNamespace(title="Group", first_name=None, last_name=None, username="g")), "Group")
+
+
+class DedicatedSessionTests(unittest.TestCase):
+    def _call_with_fake_client(self, authorized):
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, session, api_id, api_hash, **kwargs):
+                seen.update(session=session, api_id=api_id, api_hash=api_hash, kwargs=kwargs)
+
+            async def connect(self):
+                seen["connected"] = True
+
+            async def is_user_authorized(self):
+                return authorized
+
+            async def disconnect(self):
+                seen["disconnected"] = True
+
+        telethon = ModuleType("telethon")
+        telethon.TelegramClient = FakeClient
+
+        async def handler(client):
+            return "handled"
+
+        with patch.dict(sys.modules, {"telethon": telethon}), \
+             patch.object(MODULE, "_dedicated_session_path", return_value=Path("/dedicated/plugin-auth")), \
+             patch.object(MODULE, "_load_telegram_credentials", return_value=(123, "api-hash")), \
+             patch.object(MODULE, "_load_telegram_config", side_effect=AssertionError("RSS config path must not be opened"), create=True):
+            result = asyncio.run(MODULE._with_client(handler))
+        return seen, result
+
+    def test_api_client_uses_dedicated_session_not_rss_path(self):
+        seen, result = self._call_with_fake_client(True)
+        self.assertEqual(result, "handled")
+        self.assertEqual(seen["session"], "/dedicated/plugin-auth")
+        self.assertEqual(seen["api_id"], 123)
+        self.assertEqual(seen["api_hash"], "api-hash")
+        self.assertTrue(seen["connected"])
+        self.assertTrue(seen["disconnected"])
+
+    def test_unauthorized_dedicated_session_fails_closed(self):
+        with self.assertRaises(MODULE._AuthUnavailable):
+            self._call_with_fake_client(False)
+
+    def test_auth_client_uses_the_shared_session_and_credentials_only(self):
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, session, api_id, api_hash, **kwargs):
+                seen.update(session=session, api_id=api_id, api_hash=api_hash, kwargs=kwargs)
+
+        telethon = ModuleType("telethon")
+        telethon.TelegramClient = FakeClient
+        with patch.dict(sys.modules, {"telethon": telethon}), \
+             patch.object(MODULE, "_dedicated_session_path", return_value=Path("/dedicated/plugin-auth")), \
+             patch.object(MODULE, "_load_telegram_credentials", return_value=(123, "api-hash")), \
+             patch.object(MODULE, "_load_telegram_config", side_effect=AssertionError("RSS session config not required"), create=True):
+            AUTH._API_CREDENTIALS = None
+            client = AUTH._new_client()
+        self.assertIsInstance(client, FakeClient)
+        self.assertEqual(seen["session"], "/dedicated/plugin-auth")
+        self.assertEqual((seen["api_id"], seen["api_hash"]), (123, "api-hash"))
+
+    def test_auth_state_never_persists_codes_or_pending_tokens(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "auth_state.json"
+            AUTH._VOLATILE_STATE = {}
+            with patch.object(AUTH, "_state_path", return_value=path):
+                AUTH._write_state({
+                    "stage": "sent-code", "phone": "+15551234567",
+                    "code": "678901", "password": "not-stored",
+                    "phoneCodeHash": "transient-hash",
+                })
+                persisted = path.read_text(encoding="utf-8")
+                self.assertNotIn("678901", persisted)
+                self.assertNotIn("not-stored", persisted)
+                self.assertNotIn("transient-hash", persisted)
+                self.assertEqual(AUTH._read_state()["phoneCodeHash"], "transient-hash")
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                AUTH._write_state({"stage": "done", "phone": "+15551234567"})
+                self.assertEqual(AUTH._VOLATILE_STATE, {})
+
+
+class DialogFolderTests(unittest.TestCase):
+    def test_dialog_page_filters_backend_folder_before_applying_limit(self):
+        data = {
+            "folders": [{"id": "all"}, {"id": "42"}, {"id": "archive"}],
+            "dialogs": [
+                {"key": "@first", "folderIds": ["all"]},
+                {"key": "@match-1", "unread": 2, "folderIds": ["all", "42"]},
+                {"key": "@match-2", "unread": 0, "folderIds": ["all", "42"]},
+                {"key": "@archived", "folderIds": ["archive"]},
+            ],
+        }
+        result = MODULE._dialog_page(data, "42", 1)
+        self.assertEqual(result["activeFolder"], "42")
+        self.assertEqual([item["key"] for item in result["dialogs"]], ["@match-1"])
+        unread = MODULE._dialog_page(data, "all", 1, unread_only=True)
+        self.assertEqual([item["key"] for item in unread["dialogs"]], ["@match-1"])
+        fallback = MODULE._dialog_page(data, "999", 2)
+        self.assertEqual(fallback["activeFolder"], "all")
+        self.assertEqual([item["key"] for item in fallback["dialogs"]], ["@first", "@match-1"])
+
+    def test_custom_folder_ids_are_local_memberships_and_unread_is_distinct(self):
+        class User:
+            def __init__(self, ident, username, contact=False):
+                self.id = ident
+                self.username = username
+                self.first_name = username
+                self.last_name = None
+                self.title = None
+                self.bot = False
+                self.contact = contact
+                self.mutual_contact = False
+
+        class DialogFilter:
+            def __init__(self, ident, title, **flags):
+                self.id = ident
+                self.title = SimpleNamespace(text=title)
+                self.include_peers = flags.pop("include_peers", [])
+                self.exclude_peers = flags.pop("exclude_peers", [])
+                self.pinned_peers = flags.pop("pinned_peers", [])
+                for name in ("contacts", "non_contacts", "groups", "broadcasts", "bots",
+                             "exclude_muted", "exclude_read", "exclude_archived"):
+                    setattr(self, name, flags.get(name, False))
+
+        class DialogFilterChatlist:
+            def __init__(self, ident, title, include_peers):
+                self.id = ident
+                self.title = SimpleNamespace(text=title)
+                self.include_peers = include_peers
+                self.pinned_peers = []
+
+        class DialogFilterDefault:
+            pass
+
+        alice = SimpleNamespace(entity=User(101, "alice", contact=True), id=1, unread_count=0,
+                                folder_id=0, notify_settings=SimpleNamespace(mute_until=None))
+        bob = SimpleNamespace(entity=User(102, "bob"), id=2, unread_count=3,
+                              folder_id=0, notify_settings=SimpleNamespace(mute_until=None))
+        archived = SimpleNamespace(entity=User(103, "old"), id=3, unread_count=1,
+                                    folder_id=1, notify_settings=SimpleNamespace(mute_until=None))
+        filters = [
+            DialogFilterDefault(),
+            DialogFilter(7, "Contacts", contacts=True, exclude_archived=True),
+            DialogFilter(8, "Explicit people", include_peers=[bob.entity]),
+            DialogFilterChatlist(9, "Shared", [archived.entity]),
+        ]
+
+        folders, rows = MODULE._apply_dialog_filters([alice, bob, archived], filters)
+        self.assertEqual([(folder["id"], folder["title"]) for folder in folders], [
+            ("all", "All"), ("7", "Contacts"), ("8", "Explicit people"),
+            ("9", "Shared"), ("archive", "Archive"),
+        ])
+        by_key = {row["key"]: set(row["folderIds"]) for row in rows}
+        self.assertIn("7", by_key["@alice"])
+        self.assertNotIn("7", by_key["@bob"])
+        self.assertIn("8", by_key["@bob"])
+        self.assertIn("9", by_key["@old"])
+        self.assertEqual(by_key["@old"], {"archive", "9"})
+
+    def test_expired_mute_timestamp_is_not_muted(self):
+        past = SimpleNamespace(notify_settings=SimpleNamespace(mute_until=100))
+        future = SimpleNamespace(notify_settings=SimpleNamespace(mute_until=500))
+        self.assertFalse(MODULE._dialog_is_muted(past, now=200))
+        self.assertTrue(MODULE._dialog_is_muted(future, now=200))
+        self.assertFalse(MODULE._dialog_is_muted(SimpleNamespace(notify_settings=None), now=200))
+
+    def test_custom_unread_rule_keeps_its_own_stable_folder_id(self):
+        entity = SimpleNamespace(id=201, username="new", first_name="New", title=None)
+        unread_rule = SimpleNamespace(
+            id=10, title=SimpleNamespace(text="Important unread"),
+            include_peers=[entity], exclude_peers=[], pinned_peers=[], exclude_read=True,
+            exclude_muted=False, exclude_archived=True, contacts=False,
+            non_contacts=False, groups=False, broadcasts=False, bots=False,
+        )
+        dialog = SimpleNamespace(entity=entity, unread_count=2, folder_id=0, notify_settings=None)
+        folders, rows = MODULE._apply_dialog_filters([dialog], [unread_rule])
+        self.assertNotIn({"id": "unread", "title": "Unread", "kind": "unread"}, folders)
+        self.assertIn("10", rows[0]["folderIds"])
 
 
 class PublicMessageTests(unittest.TestCase):
