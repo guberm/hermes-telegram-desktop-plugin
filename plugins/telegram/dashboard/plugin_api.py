@@ -27,6 +27,14 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 
 router = APIRouter()
 
+# Standalone auth client (QR / phone code / 2FA) — its own session file.
+try:  # pragma: no cover - dashboard imports both files from one directory
+    from plugin_auth import router as _auth_router
+
+    router.include_router(_auth_router)
+except Exception:  # the auth module is optional at import time
+    pass
+
 _TELETHON_TIMEOUT_SECONDS = 20.0
 _TICKET_TTL_SECONDS = 300.0
 _MAX_TICKETS = 256
@@ -494,10 +502,15 @@ def dialogs(request: Request, scope: ScopeText, limit: Annotated[int, Query(ge=1
         async for dialog in client.iter_dialogs(limit=limit):
             entity = dialog.entity
             unread = int(getattr(dialog, "unread_count", 0) or 0)
+            notify = getattr(dialog, "notify_settings", None)
+            muted = bool(getattr(notify, "mute_until", None)) if notify is not None else False
+            folder = getattr(dialog, "folder_id", None)
             result.append({
                 "key": _peer_key(entity),
                 "name": _peer_display_name(entity),
                 "unread": unread,
+                "muted": muted,
+                "folder": int(folder) if folder is not None else 0,
                 "kind": entity.__class__.__name__,
                 "lastMessageDate": dialog.date.isoformat() if getattr(dialog, "date", None) else "",
             })

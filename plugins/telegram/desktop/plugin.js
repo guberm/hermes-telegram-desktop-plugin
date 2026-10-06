@@ -110,14 +110,50 @@ export function contextText(me, message) {
     JSON.stringify({ source: 'telegram', me, ...message }, null, 2)
 }
 
-const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false })
+const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, tab: 'all' })
 const settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`
 export function loadSettings(storage, key) {
   try {
     const raw = storage.get(key, null)
     if (!raw || typeof raw !== 'object') return { ...DEFAULT_SETTINGS }
-    return { autoRefresh: raw.autoRefresh === true }
+    return {
+      autoRefresh: raw.autoRefresh === true,
+      unmutedOnly: raw.unmutedOnly === true,
+      tab: raw.tab === 'unread' ? 'unread' : 'all',
+    }
   } catch { return { ...DEFAULT_SETTINGS } }
+}
+
+// Native-Telegram-like unread badge: solid accent pill, theme-safe on light
+// and dark backgrounds; muted chats get a subtle outline pill instead.
+export function unreadBadge(unread, muted) {
+  if (!(unread > 0)) return null
+  return jsx('span', {
+    'aria-label': `${unread} unread`,
+    style: muted
+      ? {
+          color: 'var(--ui-text-secondary)', border: '1px solid var(--ui-stroke-secondary)',
+          background: 'transparent', borderRadius: '999px', fontSize: '0.72rem',
+          fontWeight: 600, padding: '0.06rem 0.45rem', flexShrink: 0, fontVariantNumeric: 'tabular-nums',
+        }
+      : {
+          color: 'var(--ui-accent-foreground, var(--ui-bg-primary))', background: 'var(--ui-accent)',
+          borderRadius: '999px', fontSize: '0.72rem', fontWeight: 700,
+          padding: '0.06rem 0.5rem', flexShrink: 0, fontVariantNumeric: 'tabular-nums',
+        },
+    children: String(unread > 99 ? '99+' : unread),
+  })
+}
+
+// Filter dialogs the way the native client's tabs do.
+export function filterDialogs(dialogs, tab, unmutedOnly) {
+  const list = Array.isArray(dialogs) ? dialogs : []
+  return list.filter(dialog => {
+    if (!dialog || typeof dialog !== 'object') return false
+    if (unmutedOnly && dialog.muted === true) return false
+    if (tab === 'unread' && !(dialog.unread > 0)) return false
+    return true
+  })
 }
 
 function Confirmation({ ticket, pending, onCancel, onConfirm, onRestoreFocus }) {
@@ -234,12 +270,51 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
   }
 
   const waiting = busy || mutation.isPending
+  const visibleDialogs = filterDialogs(dialogsList, settings.tab, settings.unmutedOnly)
+
+  const tabBar = jsxs('div', { role: 'tablist', 'aria-label': 'Dialog filters', style: { ...row, gap: '0.25rem' }, children: [
+    jsx('button', {
+      type: 'button', role: 'tab', 'aria-selected': settings.tab === 'all',
+      onClick: () => setSettings(current => ({ ...current, tab: 'all' })),
+      style: {
+        border: 'none', cursor: 'pointer', font: 'inherit', padding: '0.25rem 0.7rem',
+        borderRadius: '999px',
+        background: settings.tab === 'all' ? 'var(--ui-accent)' : 'transparent',
+        color: settings.tab === 'all' ? 'var(--ui-accent-foreground, var(--ui-bg-primary))' : 'var(--ui-text-secondary)',
+        fontWeight: settings.tab === 'all' ? 700 : 500,
+      },
+      children: 'All',
+    }),
+    jsx('button', {
+      type: 'button', role: 'tab', 'aria-selected': settings.tab === 'unread',
+      onClick: () => setSettings(current => ({ ...current, tab: 'unread' })),
+      style: {
+        border: 'none', cursor: 'pointer', font: 'inherit', padding: '0.25rem 0.7rem',
+        borderRadius: '999px',
+        background: settings.tab === 'unread' ? 'var(--ui-accent)' : 'transparent',
+        color: settings.tab === 'unread' ? 'var(--ui-accent-foreground, var(--ui-bg-primary))' : 'var(--ui-text-secondary)',
+        fontWeight: settings.tab === 'unread' ? 700 : 500,
+      },
+      children: 'Unread',
+    }),
+  ] })
 
   return jsxs('div', { style: { ...stack, height: '100%' }, children: [
     jsxs('div', { style: { ...row, justifyContent: 'space-between' }, children: [
       jsxs('div', { style: row, children: [
         jsx('strong', { children: `Telegram — ${me}` }),
-        note(settings.autoRefresh ? 'Auto-refresh on (60s)' : 'Auto-refresh off')
+        tabBar,
+        jsx('button', {
+          type: 'button', role: 'switch', 'aria-checked': settings.unmutedOnly,
+          onClick: () => setSettings(current => ({ ...current, unmutedOnly: !current.unmutedOnly })),
+          style: {
+            border: '1px solid var(--ui-stroke-secondary)', cursor: 'pointer', font: 'inherit',
+            padding: '0.2rem 0.6rem', borderRadius: '0.4rem',
+            background: settings.unmutedOnly ? 'var(--ui-accent)' : 'transparent',
+            color: settings.unmutedOnly ? 'var(--ui-accent-foreground, var(--ui-bg-primary))' : 'var(--ui-text-secondary)',
+          },
+          children: settings.unmutedOnly ? '🔔 Unmuted only ✓' : '🔔 Unmuted only',
+        }),
       ] }),
       jsxs('div', { style: row, children: [
         action(settings.autoRefresh ? 'Turn off auto-refresh' : 'Auto-refresh (60s)', () =>
@@ -255,20 +330,17 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     ] }),
     jsxs('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(12rem, 1fr) minmax(0, 2fr)', gap: '0.75rem', flex: '1 1 auto', minHeight: 0 }, children: [
         jsx('div', { 'aria-label': 'Dialogs', style: { ...stack, overflow: 'auto', maxHeight: '70vh', border: '1px solid var(--ui-stroke-secondary)', borderRadius: '0.4rem', padding: '0.25rem' },
-          children: dialogsList.map(dialog => jsx('button', {
+          children: visibleDialogs.map(dialog => jsx('button', {
             type: 'button', onClick: () => openDialog(dialog.key),
             style: {
               display: 'flex', justifyContent: 'space-between', gap: '0.5rem', alignItems: 'center',
               padding: '0.4rem 0.5rem', borderRadius: '0.3rem', border: 'none', cursor: 'pointer',
               background: dialog.key === dialogKey ? 'var(--ui-bg-tertiary, var(--ui-bg-secondary))' : 'transparent',
-              color: 'inherit', font: 'inherit', textAlign: 'left', minWidth: 0, width: '100%',
+              color: dialog.muted ? 'var(--ui-text-secondary)' : 'inherit', font: 'inherit', textAlign: 'left', minWidth: 0, width: '100%',
             },
             children: [
-              jsx('span', { style: { ...muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: dialog.name || dialog.key }),
-              dialog.unread > 0 && jsx('span', { style: {
-                background: 'var(--ui-accent)', color: 'var(--ui-bg-primary, #fff)', borderRadius: '999px',
-                fontSize: '0.7rem', padding: '0.05rem 0.4rem', flexShrink: 0,
-              }, children: String(dialog.unread) }),
+              jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: dialog.unread > 0 && !dialog.muted ? 700 : 400 }, children: `${dialog.muted ? '🔇 ' : ''}${dialog.name || dialog.key}` }),
+              unreadBadge(dialog.unread, dialog.muted),
             ]
           }, dialog.key))
         }),
