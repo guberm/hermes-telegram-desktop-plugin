@@ -118,69 +118,140 @@ export function AuthPanel({ ctx, onAuthorized }) {
   const [phone, setPhone] = useState('')
   const [code, setCode] = useState('')
   const [password, setPassword] = useState('')
+  const [email, setEmail] = useState('')
+  const [emailCode, setEmailCode] = useState('')
+  const [hint, setHint] = useState('')
+  const [hasRecovery, setHasRecovery] = useState(false)
+  const [emailPattern, setEmailPattern] = useState('')
+  const [emailCodeSent, setEmailCodeSent] = useState(false)
+  const [codeType, setCodeType] = useState('')
+  const [nextType, setNextType] = useState('')
+  const [resendIn, setResendIn] = useState(0)
   const [qrToken, setQrToken] = useState('')
   const [me, setMe] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const live = useRef({})
+  const authorizedCallback = useRef(onAuthorized)
+  authorizedCallback.current = onAuthorized
   live.current = { mode, phone, code, password }
+
+  function applyAuthState(result) {
+    setStage(result?.stage || 'idle')
+    if (result?.phone) setPhone(result.phone)
+    if (result?.qrToken !== undefined) setQrToken(result.qrToken || '')
+    setHint(result?.hint || '')
+    setHasRecovery(!!result?.hasRecovery)
+    setEmailPattern(result?.emailPattern || '')
+    setEmailCodeSent(!!result?.emailCodeSent)
+    setCodeType(result?.codeType || '')
+    setNextType(result?.nextType || '')
+    setResendIn(Number(result?.resendIn || 0))
+    if (result?.stage === 'done') { setMe(result.me || ''); setPassword(''); authorizedCallback.current?.() }
+  }
+
+  function errorText(error) {
+    const body = error?.body
+    if (body && typeof body === 'object' && body.detail && typeof body.detail === 'object') {
+      return `${body.detail.message || 'Telegram rate limit.'} Retry in ${body.detail.retryAfter || 0} seconds.`
+    }
+    return error?.message || String(error)
+  }
 
   useEffect(() => {
     let disposed = false
     if (mode !== 'qr') return
+    let timer
     const poll = async () => {
       while (!disposed) {
         try {
-          const state = await ctx.rest('/auth/qr-poll', { timeoutMs: 30000 })
+          const state = await ctx.rest('/auth/qr-poll', { timeoutMs: 10000 })
           if (disposed) return
           if (state?.stage === 'done') {
-            setStage('done'); setMe(state.me || ''); onAuthorized?.(); return
+            setStage('done'); setMe(state.me || ''); authorizedCallback.current?.(); return
           }
+          setStage(state?.stage || 'qr-pending')
           if (state?.qrToken) setQrToken(state.qrToken)
-        } catch { /* transient; keep polling */ }
-        await new Promise(resolve => setTimeout(resolve, 2500))
+          if (state?.hint !== undefined) setHint(state.hint || '')
+          if (state?.hasRecovery !== undefined) setHasRecovery(!!state.hasRecovery)
+          if (state?.emailPattern !== undefined) setEmailPattern(state.emailPattern || '')
+          if (state?.stage === 'password') { setMode('phone'); return }
+          if (state?.stage === 'error') { setError('Telegram QR login failed. Cancel and try again.'); return }
+        } catch (e) { if (!disposed) setError(e?.message || 'Could not check QR login status.') }
+        await new Promise(resolve => { timer = setTimeout(resolve, 5000) })
       }
     }
     void poll()
-    return () => { disposed = true }
-  }, [ctx, mode, onAuthorized])
+    return () => { disposed = true; clearTimeout(timer) }
+  }, [ctx, mode])
 
   async function startPhone() {
     setBusy(true); setError('')
     try {
       const result = await ctx.rest('/auth/start-phone', { method: 'POST', body: { phone: phone.trim() }, timeoutMs: 40000 })
-      setStage(result?.stage || 'sent-code')
-      if (result?.stage === 'done') { setMe(result.me || ''); onAuthorized?.() }
-    } catch (e) { setError(e?.message || String(e)) } finally { setBusy(false) }
+      applyAuthState(result)
+    } catch (e) { setError(errorText(e)) } finally { setBusy(false) }
   }
   async function submitCode() {
     setBusy(true); setError('')
     try {
-      const result = await ctx.rest('/auth/submit-code', { method: 'POST', body: { code: code.trim() }, timeoutMs: 40000 })
-      setStage(result?.stage || 'idle')
-      if (result?.stage === 'done') { setMe(result.me || ''); onAuthorized?.() }
-    } catch (e) { setError(e?.message || String(e)) } finally { setBusy(false) }
+      const result = stage === 'email-code'
+        ? await ctx.rest('/auth/submit-email-code', { method: 'POST', body: { code: emailCode || code }, timeoutMs: 40000 })
+        : await ctx.rest('/auth/submit-code', { method: 'POST', body: { code }, timeoutMs: 40000 })
+      applyAuthState(result)
+      setCode(''); setEmailCode('')
+    } catch (e) { setError(errorText(e)) } finally { setBusy(false) }
+  }
+  async function setupEmail() {
+    setBusy(true); setError('')
+    try {
+      const result = await ctx.rest('/auth/email-setup', { method: 'POST', body: { email }, timeoutMs: 40000 })
+      applyAuthState(result)
+    } catch (e) { setError(errorText(e)) } finally { setBusy(false) }
+  }
+  async function verifySetupEmail() {
+    setBusy(true); setError('')
+    try {
+      const result = await ctx.rest('/auth/verify-email-setup', { method: 'POST', body: { code: emailCode }, timeoutMs: 40000 })
+      applyAuthState(result)
+      setEmailCode('')
+    } catch (e) { setError(errorText(e)) } finally { setBusy(false) }
+  }
+  async function resendCode() {
+    setBusy(true); setError('')
+    try { applyAuthState(await ctx.rest('/auth/resend-code', { method: 'POST', timeoutMs: 40000 })) }
+    catch (e) { setError(errorText(e)) } finally { setBusy(false) }
   }
   async function submitPassword() {
     setBusy(true); setError('')
     try {
       const result = await ctx.rest('/auth/submit-password', { method: 'POST', body: { password }, timeoutMs: 40000 })
-      setStage(result?.stage || 'idle')
-      if (result?.stage === 'done') { setMe(result.me || ''); onAuthorized?.() }
-    } catch (e) { setError(e?.message || String(e)) } finally { setBusy(false) }
+      applyAuthState(result)
+    } catch (e) { setError(errorText(e)) } finally { setPassword(''); setBusy(false) }
+  }
+  async function requestPasswordRecovery() {
+    setBusy(true); setError('')
+    try { applyAuthState(await ctx.rest('/auth/password-recovery', { method: 'POST', timeoutMs: 40000 })) }
+    catch (e) { setError(errorText(e)) } finally { setBusy(false) }
+  }
+  async function verifyPasswordRecovery() {
+    setBusy(true); setError('')
+    try {
+      applyAuthState(await ctx.rest('/auth/password-recovery/verify', {
+        method: 'POST', body: { code: emailCode }, timeoutMs: 40000,
+      }))
+      setEmailCode('')
+    } catch (e) { setError(errorText(e)) } finally { setBusy(false) }
   }
   async function startQr() {
     setBusy(true); setError('')
-    try {
-      const result = await ctx.rest('/auth/qr-start', { method: 'POST', timeoutMs: 40000 })
-      setQrToken(result?.qrToken || '')
-      setStage(result?.stage || 'qr-pending')
-    } catch (e) { setError(e?.message || String(e)) } finally { setBusy(false) }
+    try { applyAuthState(await ctx.rest('/auth/qr-start', { method: 'POST', timeoutMs: 40000 })) }
+    catch (e) { setError(errorText(e)) } finally { setBusy(false) }
   }
   async function cancel() {
     setBusy(true)
     try { await ctx.rest('/auth/cancel', { method: 'POST', timeoutMs: 30000 }) } catch { /* ignore */ }
-    setMode('choose'); setStage('idle'); setCode(''); setPassword(''); setQrToken(''); setError('')
+    setMode('choose'); setStage('idle'); setCode(''); setEmailCode(''); setPassword(''); setQrToken(''); setError('')
     setBusy(false)
   }
 
@@ -202,16 +273,35 @@ export function AuthPanel({ ctx, onAuthorized }) {
         jsx(Field, { label: 'Phone (+15551234567)', value: phone, onChange: setPhone, disabled: busy }),
         action(stage === 'idle' ? 'Send code' : 'Sending…', () => { void startPhone() }, busy || phone.trim().length < 6),
       ] }),
-      stage === 'sent-code' && jsxs('div', { style: stack, children: [
-        note(`Code sent to ${phone}. Enter it below (check Telegram app or SMS).`),
-        jsx(Field, { label: 'Login code', value: code, onChange: setCode, disabled: busy }),
-        action('Verify code', () => { void submitCode() }, busy || code.trim().length < 4),
+      ['sent-code', 'email-code'].includes(stage) && jsxs('div', { style: stack, children: [
+        note(`Code sent to ${phone}. ${stage === 'email-code' ? `Check ${emailPattern || 'your email'}.` : `Delivery: ${codeType || 'Telegram code'}.`}`),
+        jsx(Field, { label: stage === 'email-code' ? 'Email verification code' : 'Login code', value: stage === 'email-code' ? emailCode : code, onChange: stage === 'email-code' ? setEmailCode : setCode, disabled: busy }),
+        action('Verify code', () => { void submitCode() }, busy || (stage === 'email-code' ? !emailCode.trim() : code.trim().length < 4)),
+        nextType && action(`Resend / switch to ${nextType.replace('SentCodeType', '')}`, () => { void resendCode() }, busy || (resendIn > 0), { title: resendIn > 0 ? `Available in ${resendIn}s` : 'Request the next Telegram delivery method' }),
+      ] }),
+      stage === 'email-setup' && jsxs('div', { style: stack, children: [
+        note(`Telegram requires a login email${emailPattern ? ` (${emailPattern})` : ''} before continuing.`),
+        jsx(Field, { label: 'Email address', value: email, onChange: setEmail, disabled: busy, type: 'email', autoComplete: 'email' }),
+        action('Send verification email', () => { void setupEmail() }, busy || !email.includes('@')),
+        emailCodeSent && jsxs('div', { style: stack, children: [
+          jsx(Field, { label: 'Email verification code', value: emailCode, onChange: setEmailCode, disabled: busy }),
+          action('Verify email', () => { void verifySetupEmail() }, busy || !emailCode.trim()),
+        ] }),
       ] }),
       stage === 'password' && jsxs('div', { style: stack, children: [
-        note('Two-factor authentication is enabled. Enter your Telegram password (used once, never stored).'),
-        jsx(Field, { label: '2FA password', value: password, onChange: setPassword, disabled: busy, type: 'password' }),
+        note(`Two-factor authentication is enabled.${hint ? ` Password hint: ${hint}` : ''}${emailPattern ? ` Recovery email: ${emailPattern}` : ''}`),
+        jsx(Field, { label: '2FA password', value: password, onChange: setPassword, disabled: busy, type: 'password', autoComplete: 'current-password' }),
         action('Sign in', () => { void submitPassword() }, busy || !password),
+        hasRecovery && action('Recover password by email', () => { void requestPasswordRecovery() }, busy),
       ] }),
+      stage === 'password-recovery' && jsxs('div', { style: stack, children: [
+        note(`Telegram sent a recovery code to ${emailPattern || 'your recovery email'}. Password recovery may affect account access; use the code only if you requested recovery.`),
+        jsx(Field, { label: 'Recovery code', value: emailCode, onChange: setEmailCode, disabled: busy, autoComplete: 'one-time-code' }),
+        action('Verify recovery code', () => { void verifyPasswordRecovery() }, busy || !emailCode.trim()),
+      ] }),
+      ['signup-required', 'payment-required', 'error'].includes(stage) && note(
+        stage === 'signup-required' ? 'Telegram requires account signup, which this plugin does not support. No login completed.' :
+        stage === 'payment-required' ? 'Telegram requires a paid login flow that this plugin does not support.' : 'Telegram could not complete this login. Cancel and restart the flow.', true),
       stage === 'done' && jsx('div', { children: note(`Signed in${me ? ` as ${me}` : ''}.`) }),
     ] }),
     mode === 'qr' && jsxs('div', { style: stack, children: [

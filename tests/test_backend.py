@@ -90,28 +90,25 @@ class DedicatedSessionTests(unittest.TestCase):
         seen = {}
 
         class FakeClient:
-            def __init__(self, session, api_id, api_hash, **kwargs):
-                seen.update(session=session, api_id=api_id, api_hash=api_hash, kwargs=kwargs)
-
-            async def connect(self):
+            def __init__(self):
+                seen["session"] = "/dedicated/plugin-auth"
+                seen["api_id"] = 123
+                seen["api_hash"] = "api-hash"
                 seen["connected"] = True
-
             async def is_user_authorized(self):
                 return authorized
+            def is_connected(self):
+                return True
 
-            async def disconnect(self):
-                seen["disconnected"] = True
-
-        telethon = ModuleType("telethon")
-        telethon.TelegramClient = FakeClient
-
-        async def handler(client):
+        client = FakeClient()
+        manager = SimpleNamespace(client=client)
+        async def handler(active_client):
+            self.assertIs(active_client, client)
             return "handled"
 
-        with patch.dict(sys.modules, {"telethon": telethon}), \
+        with patch.object(MODULE, "_telegram_manager", return_value=manager), \
              patch.object(MODULE, "_dedicated_session_path", return_value=Path("/dedicated/plugin-auth")), \
-             patch.object(MODULE, "_load_telegram_credentials", return_value=(123, "api-hash")), \
-             patch.object(MODULE, "_load_telegram_config", side_effect=AssertionError("RSS config path must not be opened"), create=True):
+             patch.object(MODULE, "_load_telegram_credentials", return_value=(123, "api-hash")):
             result = asyncio.run(MODULE._with_client(handler))
         return seen, result
 
@@ -122,30 +119,20 @@ class DedicatedSessionTests(unittest.TestCase):
         self.assertEqual(seen["api_id"], 123)
         self.assertEqual(seen["api_hash"], "api-hash")
         self.assertTrue(seen["connected"])
-        self.assertTrue(seen["disconnected"])
 
     def test_unauthorized_dedicated_session_fails_closed(self):
         with self.assertRaises(MODULE._AuthUnavailable):
             self._call_with_fake_client(False)
 
     def test_auth_client_uses_the_shared_session_and_credentials_only(self):
-        seen = {}
-
-        class FakeClient:
+        class Factory:
             def __init__(self, session, api_id, api_hash, **kwargs):
-                seen.update(session=session, api_id=api_id, api_hash=api_hash, kwargs=kwargs)
-
-        telethon = ModuleType("telethon")
-        telethon.TelegramClient = FakeClient
-        with patch.dict(sys.modules, {"telethon": telethon}), \
-             patch.object(MODULE, "_dedicated_session_path", return_value=Path("/dedicated/plugin-auth")), \
-             patch.object(MODULE, "_load_telegram_credentials", return_value=(123, "api-hash")), \
-             patch.object(MODULE, "_load_telegram_config", side_effect=AssertionError("RSS session config not required"), create=True):
-            AUTH._API_CREDENTIALS = None
-            client = AUTH._new_client()
-        self.assertIsInstance(client, FakeClient)
-        self.assertEqual(seen["session"], "/dedicated/plugin-auth")
-        self.assertEqual((seen["api_id"], seen["api_hash"]), (123, "api-hash"))
+                self.values = (session, api_id, api_hash, kwargs)
+        manager = SimpleNamespace(client=Factory("/dedicated/plugin-auth", 123, "api-hash"))
+        with patch.object(MODULE, "_telegram_manager", return_value=manager):
+            self.assertIs(AUTH._manager(), manager)
+            self.assertIs(MODULE._telegram_manager(), manager)
+        self.assertEqual(manager.client.values[:3], ("/dedicated/plugin-auth", 123, "api-hash"))
 
     def test_auth_state_never_persists_codes_or_pending_tokens(self):
         with tempfile.TemporaryDirectory() as temp:

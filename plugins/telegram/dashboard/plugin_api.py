@@ -30,22 +30,61 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 
 router = APIRouter()
 
-# Standalone auth client (QR / phone code / 2FA) — its own session file.
-# The dashboard server imports this file by path without putting this
-# directory on sys.path, so load plugin_auth explicitly from this directory.
+# One shared TelegramClient per dedicated profile session; each instance is
+# serialized by its own owner loop and guarded by the on-disk process lock.
+_TELEGRAM_MANAGERS: dict[str, Any] = {}
+_TELEGRAM_MANAGER_LOCK = threading.Lock()
+
+
+def _telegram_manager() -> Any:
+    session_path = _dedicated_session_path().expanduser().resolve(strict=False)
+    key = str(session_path)
+    with _TELEGRAM_MANAGER_LOCK:
+        manager = _TELEGRAM_MANAGERS.get(key)
+        if manager is None:
+            module_name = "hermes_dashboard_plugin_telegram_client"
+            client_module = sys.modules.get(module_name)
+            if client_module is None:
+                client_path = Path(__file__).resolve().parent / "telegram_client.py"
+                spec = importlib.util.spec_from_file_location(module_name, client_path)
+                if spec is None or spec.loader is None:
+                    raise RuntimeError("cannot locate telegram_client.py")
+                client_module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = client_module
+                spec.loader.exec_module(client_module)
+            credentials = _load_telegram_credentials()
+            manager = client_module.TelegramClientManager(session_path, lambda: credentials)
+            _TELEGRAM_MANAGERS[key] = manager
+        return manager
+
+
+def _shutdown_managers() -> None:
+    with _TELEGRAM_MANAGER_LOCK:
+        managers = list(_TELEGRAM_MANAGERS.values())
+        _TELEGRAM_MANAGERS.clear()
+    for manager in managers:
+        try:
+            manager.close()
+        except Exception:
+            continue
+
+
 def _mount_auth_router() -> None:
-    auth_path = Path(__file__).resolve().parent / "plugin_auth.py"
-    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_telegram_auth", auth_path)
-    if spec is None or spec.loader is None:
-        return
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:  # auth stays unavailable; /status keeps working
-        sys.modules.pop(spec.name, None)
-        return
-    router.include_router(module.router)
+    module_name = "hermes_dashboard_plugin_telegram_auth"
+    existing = sys.modules.get(module_name)
+    if existing is None:
+        auth_path = Path(__file__).resolve().parent / "plugin_auth.py"
+        spec = importlib.util.spec_from_file_location(module_name, auth_path)
+        if spec is None or spec.loader is None:
+            return
+        existing = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = existing
+        try:
+            spec.loader.exec_module(existing)
+        except Exception:
+            sys.modules.pop(spec.name, None)
+            return
+    router.include_router(existing.router)
 
 
 _mount_auth_router()
@@ -280,32 +319,16 @@ def _dedicated_session_path() -> Path:
 
 
 async def _with_client(handler: Callable[[Any], Any]) -> Any:
-    from telethon import TelegramClient
-
-    api_id, api_hash = _load_telegram_credentials()
-    client = TelegramClient(
-        str(_dedicated_session_path()),
-        api_id,
-        api_hash,
-        receive_updates=False,
-    )
-    await client.connect()
-    try:
-        if not await client.is_user_authorized():
-            raise _AuthUnavailable("Telegram session is not authorized")
-        return await handler(client)
-    finally:
-        await client.disconnect()
+    client = _telegram_manager().client
+    if client is None:
+        raise RuntimeError("Telegram client manager is not initialized")
+    if not await client.is_user_authorized():
+        raise _AuthUnavailable("Telegram session is not authorized")
+    return await handler(client)
 
 
 def _run_async(coroutine: Any) -> Any:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        pass
-    else:  # pragma: no cover - FastAPI runs handlers in worker threads
-        raise RuntimeError("must not run inside a running event loop")
-    return asyncio.run(asyncio.wait_for(coroutine, timeout=_TELETHON_TIMEOUT_SECONDS))
+    return _telegram_manager().run(coroutine)
 
 
 def _public_message(message: Any, me_id: int) -> dict[str, Any]:

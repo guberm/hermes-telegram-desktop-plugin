@@ -34,7 +34,8 @@ class ShippedSourceContractTests(unittest.TestCase):
     def test_session_resolves_at_request_time_and_never_persists_secrets(self):
         self.assertIn('"rss_reader" / "config.json"', self.backend_text)
         self.assertIn('"telegram-plugin-auth"', self.backend_text)
-        self.assertIn('str(_dedicated_session_path())', self.backend_text)
+        self.assertIn("_dedicated_session_path()", self.backend_text)
+        self.assertIn("_telegram_manager()", self.backend_text)
         self.assertNotIn('config["session_path"]', self.backend_text)
         self.assertIn("get_hermes_home", self.backend_text)
         for forbidden in ("session_path.write", "json.dump", "to_json()"):
