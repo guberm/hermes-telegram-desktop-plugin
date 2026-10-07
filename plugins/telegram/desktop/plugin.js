@@ -527,6 +527,21 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     void client.invalidateQueries({ queryKey: [...queryPrefix, scope] })
   }
 
+  async function markDialogRead(dialog) {
+    if (guard.current || statusUnavailable || !dialog?.key || !(dialog.unread > 0)) return
+    guard.current = true; setBusy(true); setFeedback(null)
+    try {
+      const result = await ctx.rest('/dialogs/mark-read', { method: 'POST', body: { peer: dialog.key }, timeoutMs: 60000 })
+      if (result?.status !== 'verified') throw new Error('Unverified read state')
+      if (mounted.current) {
+        setFeedback({ text: `Marked as read: ${result.peer || dialog.key}` })
+        refreshAll()
+      }
+    } catch (e) {
+      if (mounted.current) setFeedback({ error: true, text: `Could not mark as read. ${errorText(e)}` })
+    } finally { guard.current = false; if (mounted.current) setBusy(false) }
+  }
+
   async function prepareAndConfirm(body) {
     if (guard.current || statusUnavailable) return
     guard.current = true; setBusy(true); setFeedback(null)
@@ -642,6 +657,10 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             },
             children: [
               jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: dialog.unread > 0 && !dialog.muted ? 700 : 400 }, children: `${dialog.muted ? '🔇 ' : ''}${dialog.name || dialog.key}` }),
+              dialog.unread > 0 && action('Mark as read', () => { void markDialogRead(dialog) }, waiting, {
+                title: 'Mark this chat as read (advances the read pointer to its newest message)',
+                style: { padding: '0.15rem 0.5rem', fontSize: '0.75rem', flexShrink: 0 },
+              }),
               unreadBadge(dialog.unread, dialog.muted),
             ]
           }, dialog.key))

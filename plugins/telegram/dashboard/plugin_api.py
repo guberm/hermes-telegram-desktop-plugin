@@ -90,6 +90,8 @@ def _mount_auth_router() -> None:
 _mount_auth_router()
 
 _TELETHON_TIMEOUT_SECONDS = 20.0
+_DIALOG_SNAPSHOT_LIMIT = 500
+_DIALOG_CACHE_TTL_SECONDS = 20.0
 _TICKET_TTL_SECONDS = 300.0
 _MAX_TICKETS = 256
 _MAX_SCOPES = 128
@@ -107,6 +109,10 @@ ScopeText = Annotated[str, StringConstraints(min_length=20, max_length=256, patt
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class _MarkReadBody(_StrictModel):
+    peer: Annotated[str, StringConstraints(min_length=1, max_length=256)]
 
 
 class SendPrepare(_StrictModel):
@@ -701,29 +707,113 @@ def dialogs(
     binding = _binding(scope)
     me, _ = _provider_context(binding)
 
-    async def _collect(client: Any) -> dict[str, Any]:
-        from telethon import functions
-        from telethon.tl.types import DialogFilter, DialogFilterChatlist
+    # Folder/tab switches reuse the snapshot for a few seconds: switching tabs
+    # must be instant like the native client; the Refresh button bypasses it.
+    cached = _dialog_cache_get(scope)
+    if cached is None:
+        async def _collect(client: Any) -> dict[str, Any]:
+            from telethon import functions
+            from telethon.tl.types import DialogFilter, DialogFilterChatlist
 
-        result: list[Any] = []
-        async for dialog in client.iter_dialogs():
-            result.append(dialog)
-        response = await client(functions.messages.GetDialogFiltersRequest())
-        telegram_filters = [
-            definition for definition in (getattr(response, "filters", None) or [])
-            if isinstance(definition, (DialogFilter, DialogFilterChatlist))
-        ]
-        folders, rows = _apply_dialog_filters(result, telegram_filters)
-        return {"dialogs": rows, "folders": folders}
+            # Bounded snapshot: a full unbounded iter_dialogs over hundreds of
+            # chats dominated request latency; the native client also works from
+            # a bounded, cached dialog list. Folders beyond the snapshot window
+            # are acceptable for a read pane.
+            result: list[Any] = []
+            async for dialog in client.iter_dialogs(limit=_DIALOG_SNAPSHOT_LIMIT):
+                result.append(dialog)
+            response = await client(functions.messages.GetDialogFiltersRequest())
+            telegram_filters = [
+                definition for definition in (getattr(response, "filters", None) or [])
+                if isinstance(definition, (DialogFilter, DialogFilterChatlist))
+            ]
+            folders, rows = _apply_dialog_filters(result, telegram_filters)
+            return {"dialogs": rows, "folders": folders, "fetchedAt": time.time()}
+
+        try:
+            data = _run_async(_with_client(_collect))
+        except _AuthUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Telegram backend unavailable: {exc}") from None
+        except Exception:
+            raise _provider_error() from None
+        _dialog_cache_put(scope, data)
+    else:
+        data = cached
+    page = _dialog_page(data, folder, limit, unread_only=unreadOnly)
+    return {**page, "me": me}
+
+
+_DIALOG_CACHE_LOCK = threading.Lock()
+_DIALOG_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+
+def _dialog_cache_get(scope: str) -> dict[str, Any] | None:
+    with _DIALOG_CACHE_LOCK:
+        entry = _DIALOG_CACHE.get(scope)
+        if entry is None:
+            return None
+        if time.time() - entry["fetchedAt"] > _DIALOG_CACHE_TTL_SECONDS:
+            _DIALOG_CACHE.pop(scope, None)
+            return None
+        _DIALOG_CACHE.move_to_end(scope)
+        return entry["data"]
+
+
+def _dialog_cache_put(scope: str, data: dict[str, Any]) -> None:
+    with _DIALOG_CACHE_LOCK:
+        _DIALOG_CACHE[scope] = {"fetchedAt": data.get("fetchedAt", time.time()), "data": data}
+        while len(_DIALOG_CACHE) > 8:
+            _DIALOG_CACHE.popitem(last=False)
+
+
+@router.post("/dialogs/mark-read")
+def mark_read(
+    request: Request,
+    scope: ScopeText,
+    body: _MarkReadBody,
+) -> dict[str, Any]:
+    """Mark one dialog's history as read (channels: mark channel read).
+
+    Read-only guarantee: only advances the read pointer to the dialog's top
+    message; verifies the resulting unread count and invalidates the dialog
+    cache so counters refresh immediately.
+    """
+    _reject_query_extras(request, set())
+    binding = _binding(scope)
+    me, _ = _provider_context(binding)
+
+    async def _mark(client: Any) -> dict[str, Any]:
+        from telethon import functions, utils
+
+        entity, name = await _peer_out(client, body.peer)
+        peer_key = _peer_key(entity)
+        # The dialog's top message is the read ceiling; unread counters drop to
+        # zero exactly like pressing the chat in the native client.
+        dialog = await client.get_dialogs(limit=_DIALOG_SNAPSHOT_LIMIT)
+        target = next((d for d in dialog if d.id == entity.id), None)
+        max_id = 0
+        if target is not None and getattr(target, "message", None) is not None:
+            max_id = int(target.message.id)
+        if getattr(entity, "broadcast", False):
+            await client(functions.channels.ReadHistoryRequest(utils.get_input_channel(entity), max_id=max_id))
+        else:
+            await client(functions.messages.ReadHistoryRequest(utils.get_input_peer(entity), max_id=max_id))
+        # Read back the resulting unread count from a fresh dialogs page.
+        fresh = await client.get_dialogs(limit=_DIALOG_SNAPSHOT_LIMIT)
+        after = next((d for d in fresh if d.id == entity.id), None)
+        unread_after = int(getattr(after, "unread_count", 0) or 0) if after is not None else 0
+        return {"peer": name, "peerKey": peer_key, "unread": unread_after}
 
     try:
-        data = _run_async(_with_client(_collect))
+        outcome = _run_async(_with_client(_mark))
     except _AuthUnavailable as exc:
         raise HTTPException(status_code=503, detail=f"Telegram backend unavailable: {exc}") from None
     except Exception:
         raise _provider_error() from None
-    page = _dialog_page(data, folder, limit, unread_only=unreadOnly)
-    return {**page, "me": me}
+    if outcome["unread"] != 0:
+        raise _provider_error(mutation_started=True)
+    _DIALOG_CACHE.pop(scope, None)
+    return {"status": "verified", **outcome}
 
 
 @router.get("/messages")
