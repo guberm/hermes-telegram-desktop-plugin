@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+import json
 import sys
 import tempfile
 import time
@@ -175,6 +176,25 @@ class DialogFolderTests(unittest.TestCase):
         self.assertEqual(fallback["activeFolder"], "all")
         self.assertEqual([item["key"] for item in fallback["dialogs"]], ["@first", "@match-1"])
 
+    def test_unmuted_filter_is_applied_before_limit_and_can_be_disabled(self):
+        data = {
+            "folders": [{"id": "all"}],
+            "dialogs": [
+                {"key": "@muted-1", "muted": True, "folderIds": ["all"]},
+                {"key": "@visible-1", "muted": False, "folderIds": ["all"]},
+            ],
+        }
+        request = SimpleNamespace(query_params={})
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_dialog_cache_get", return_value=data),
+        ):
+            filtered = MODULE.dialogs(request, scope="test-scope", limit=1, folder="all", unmutedOnly=True)
+            restored = MODULE.dialogs(request, scope="test-scope", limit=1, folder="all", unmutedOnly=False)
+        self.assertEqual([row["key"] for row in filtered["dialogs"]], ["@visible-1"])
+        self.assertEqual([row["key"] for row in restored["dialogs"]], ["@muted-1"])
+
     def test_custom_folder_ids_are_local_memberships_and_unread_is_distinct(self):
         class User:
             def __init__(self, ident, username, contact=False):
@@ -280,6 +300,9 @@ class PublicMessageTests(unittest.TestCase):
             async def get_me(self):
                 return SimpleNamespace(id=1)
 
+            async def get_dialogs(self, limit=None):
+                return []
+
             async def iter_messages(self, entity, **kwargs):
                 for mid in (3, 2, 1):
                     yield make_message(mid)
@@ -300,6 +323,135 @@ class PublicMessageTests(unittest.TestCase):
             )
         self.assertEqual([item["id"] for item in result["messages"]], [1, 2, 3])
 
+    def test_message_history_starts_at_read_cursor_and_excludes_older_posts(self):
+        entity = SimpleNamespace(id=123, title="Test Group", username="testgroup")
+        dialog = SimpleNamespace(
+            id=123, entity=entity,
+            dialog=SimpleNamespace(read_inbox_max_id=5),
+        )
+        seen = {}
+
+        class Client:
+            async def get_entity(self, peer):
+                return entity
+
+            async def get_me(self):
+                return SimpleNamespace(id=1)
+
+            async def get_dialogs(self, limit=None):
+                return [dialog]
+
+            async def iter_messages(self, active_entity, **kwargs):
+                seen.update(kwargs)
+                ids = [2, 3, 4, 5, 6, 7, 8]
+                if kwargs.get("reverse"):
+                    ids = [mid for mid in ids if mid > kwargs.get("min_id", 0)]
+                else:
+                    ids = list(reversed(ids))
+                for mid in ids[:kwargs["limit"]]:
+                    yield make_message(mid)
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.messages(
+                SimpleNamespace(query_params={}), scope="test-scope", peer="@testgroup", limit=3, topicId=0,
+            )
+
+        self.assertEqual(seen.get("min_id"), 4, "cursor message itself must be included")
+        self.assertTrue(seen.get("reverse"), "fetch forward from the read cursor")
+        self.assertEqual([item["id"] for item in result["messages"]], [5, 6, 7])
+
+    def test_forum_thread_history_starts_at_topic_read_cursor(self):
+        entity = SimpleNamespace(id=123, title="Test Group", username="testgroup", forum=True)
+        seen = {}
+
+        class Client:
+            async def get_entity(self, peer):
+                return entity
+
+            async def get_me(self):
+                return SimpleNamespace(id=1)
+
+            async def __call__(self, request):
+                self.request = request
+                return SimpleNamespace(topics=[SimpleNamespace(id=44, read_inbox_max_id=5)])
+
+            async def iter_messages(self, active_entity, **kwargs):
+                seen.update(kwargs)
+                for mid in (5, 6, 7):
+                    yield make_message(mid)
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.messages(
+                SimpleNamespace(query_params={}), scope="test-scope", peer="@testgroup", limit=3, topicId=44,
+            )
+        self.assertEqual(type(client.request).__name__, "GetForumTopicsByIDRequest")
+        self.assertEqual(client.request.topics, [44])
+        self.assertEqual(seen.get("reply_to"), 44)
+        self.assertEqual(seen.get("min_id"), 4)
+        self.assertTrue(seen.get("reverse"))
+        self.assertEqual([item["id"] for item in result["messages"]], [5, 6, 7])
+
+    def test_general_forum_topic_history_filters_other_topics(self):
+        entity = SimpleNamespace(id=123, title="Test Group", username="testgroup", forum=True)
+        seen = {}
+
+        class Client:
+            async def get_entity(self, peer):
+                return entity
+
+            async def get_me(self):
+                return SimpleNamespace(id=1)
+
+            async def __call__(self, request):
+                return SimpleNamespace(topics=[SimpleNamespace(id=1, read_inbox_max_id=0)])
+
+            async def iter_messages(self, active_entity, **kwargs):
+                seen.update(kwargs)
+                general_early = make_message(5)
+                other_thread = make_message(6)
+                other_thread.reply_to = SimpleNamespace(reply_to_msg_id=55, reply_to_top_id=55)
+                general_late = make_message(7)
+                for message in (general_late, other_thread, general_early):
+                    yield message
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.messages(
+                SimpleNamespace(query_params={}), scope="test-scope", peer="@testgroup", limit=2, topicId=1,
+            )
+        self.assertNotIn("reply_to", seen, "General is not a message thread")
+        self.assertGreater(seen["limit"], 2, "read a bounded surplus to filter other topics")
+        self.assertEqual([item["id"] for item in result["messages"]], [5, 7])
+
     def test_messages_include_bounded_raster_photo_previews(self):
         from base64 import b64decode
 
@@ -317,6 +469,9 @@ class PublicMessageTests(unittest.TestCase):
 
             async def get_me(self):
                 return SimpleNamespace(id=1)
+
+            async def get_dialogs(self, limit=None):
+                return []
 
             async def iter_messages(self, entity, **kwargs):
                 yield message
@@ -357,6 +512,9 @@ class PublicMessageTests(unittest.TestCase):
 
             async def get_me(self):
                 return SimpleNamespace(id=1)
+
+            async def get_dialogs(self, limit=None):
+                return []
 
             async def iter_messages(self, entity, **kwargs):
                 yield message
@@ -476,7 +634,251 @@ class CommitFlowTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
 
 
+class MarkReadActionTests(unittest.TestCase):
+    def setUp(self):
+        self.request = SimpleNamespace(query_params={})
+        self.scope = "mark-read-scope" * 2
+        self.binding = MODULE._ScopeBinding("backend", "/home", "me", 0)
+        self.entity = SimpleNamespace(id=123, title="Test Group", username="group", forum=True)
+        self.target = make_message(321, "exact target")
+        self.dialog = SimpleNamespace(
+            id=123, entity=self.entity, unread_count=2,
+            dialog=SimpleNamespace(read_inbox_max_id=300),
+            message=SimpleNamespace(id=330),
+        )
+        self.reads = []
+        self.topic_reads = []
+        self.topic = SimpleNamespace(id=11, read_inbox_max_id=300, unread_count=2)
+
+        class Client:
+            async def get_entity(inner, peer):
+                return self.entity
+
+            async def get_me(inner):
+                return SimpleNamespace(id=1)
+
+            async def get_dialogs(inner, limit=None):
+                return [self.dialog]
+
+            async def get_messages(inner, entity, ids):
+                return self.target if ids == 321 else None
+
+            async def send_read_acknowledge(inner, entity, max_id=None):
+                self.reads.append((entity, max_id))
+                self.dialog.dialog.read_inbox_max_id = max_id
+                # Simulate newer unread posts remaining after the bounded ack.
+                self.dialog.unread_count = 2
+
+            async def __call__(inner, request):
+                request_name = type(request).__name__
+                if request_name == "GetForumTopicsByIDRequest":
+                    return SimpleNamespace(topics=[self.topic] if 11 in request.topics else [])
+                if request_name == "ReadDiscussionRequest":
+                    self.topic_reads.append((request.peer, request.msg_id, request.read_max_id))
+                    self.topic.read_inbox_max_id = request.read_max_id
+                    return True
+                raise AssertionError(f"Unexpected Telegram request: {request_name}")
+
+        self.client = Client()
+
+        async def with_client(handler):
+            return await handler(self.client)
+
+        self.patches = (
+            patch.object(MODULE, "_binding", return_value=self.binding),
+            patch.object(MODULE, "_provider_context", return_value=("me", "/home")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        )
+        for item in self.patches:
+            item.start()
+        self.addCleanup(lambda: [item.stop() for item in reversed(self.patches)])
+
+    def test_prepare_preview_is_exact_and_confirmed_commit_preserves_newer_unread(self):
+        body = MODULE.MarkReadPrepare(
+            scope=self.scope, action="mark-read", peer="@group", maxId=321,
+        )
+        prepared = MODULE.prepare_action(self.request, body)
+        ticket = MODULE._tickets[prepared["confirmationToken"]]
+        self.assertEqual(prepared["preview"]["maxId"], 321)
+        self.assertEqual(prepared["preview"]["targetMessage"]["id"], 321)
+        self.assertIsInstance(ticket.message_snapshot, dict)
+        self.assertEqual(ticket.message_snapshot["id"], 321)
+        self.assertEqual(self.reads, [], "prepare must not change Telegram read state")
+
+        result = MODULE.commit_action(self.request, MODULE.CommitRequest(
+            scope=self.scope, confirmationToken=prepared["confirmationToken"], confirmed=True,
+        ))
+        self.assertEqual(self.reads, [(self.entity, 321)])
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["readCursor"], 321)
+        self.assertEqual(result["unread"], 2, "posts after the selected target remain unread")
+
+    def test_forum_topic_mark_read_uses_thread_scoped_rpc(self):
+        self.target.reply_to = SimpleNamespace(reply_to_msg_id=11, reply_to_top_id=11)
+        prepared = MODULE.prepare_action(self.request, MODULE.MarkReadPrepare(
+            scope=self.scope, action="mark-read", peer="@group", maxId=321, topicId=11,
+        ))
+        self.assertEqual(prepared["preview"]["topicId"], 11)
+        self.assertEqual(self.reads, [])
+
+        result = MODULE.commit_action(self.request, MODULE.CommitRequest(
+            scope=self.scope, confirmationToken=prepared["confirmationToken"], confirmed=True,
+        ))
+        self.assertEqual(self.reads, [], "a topic action must not acknowledge the whole group")
+        self.assertEqual(self.topic_reads, [(self.entity, 11, 321)])
+        self.assertEqual(result["readCursor"], 321)
+
+    def test_prepare_rejects_target_from_a_different_forum_topic(self):
+        self.target.reply_to = SimpleNamespace(reply_to_msg_id=55, reply_to_top_id=22)
+        with self.assertRaises(HTTPException) as raised:
+            MODULE.prepare_action(self.request, MODULE.MarkReadPrepare(
+                scope=self.scope, action="mark-read", peer="@group", maxId=321, topicId=11,
+            ))
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(self.topic_reads, [])
+
+    def test_commit_rejects_target_moved_to_another_forum_topic(self):
+        self.target.reply_to = SimpleNamespace(reply_to_msg_id=55, reply_to_top_id=11)
+        prepared = MODULE.prepare_action(self.request, MODULE.MarkReadPrepare(
+            scope=self.scope, action="mark-read", peer="@group", maxId=321, topicId=11,
+        ))
+        self.target.reply_to = SimpleNamespace(reply_to_msg_id=55, reply_to_top_id=22)
+        with self.assertRaises(HTTPException) as raised:
+            MODULE.commit_action(self.request, MODULE.CommitRequest(
+                scope=self.scope, confirmationToken=prepared["confirmationToken"], confirmed=True,
+            ))
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(self.topic_reads, [], "a topic change after preview must not be acknowledged")
+
+    def test_general_topic_read_is_rejected_without_group_wide_ack(self):
+        with self.assertRaises(HTTPException) as raised:
+            MODULE.prepare_action(self.request, MODULE.MarkReadPrepare(
+                scope=self.scope, action="mark-read", peer="@group", maxId=321, topicId=1,
+            ))
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(self.reads, [])
+        self.assertEqual(self.topic_reads, [])
+
+    def test_commit_rejects_changed_target_before_read_ack(self):
+        prepared = MODULE.prepare_action(self.request, MODULE.MarkReadPrepare(
+            scope=self.scope, action="mark-read", peer="@group", maxId=321,
+        ))
+        self.target.message = "target changed after preview"
+        with self.assertRaises(HTTPException) as raised:
+            MODULE.commit_action(self.request, MODULE.CommitRequest(
+                scope=self.scope, confirmationToken=prepared["confirmationToken"], confirmed=True,
+            ))
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(self.reads, [], "stale preview must not mark anything read")
+
+
+class ForumTopicsRouteTests(unittest.TestCase):
+    def test_topics_serialization_and_nonforum_detection(self):
+        from telethon.tl.types import ForumTopic, ForumTopicDeleted, PeerChannel, PeerNotifySettings, PeerUser
+
+        entity = SimpleNamespace(id=123, title="Test Group", username="group", forum=True)
+        topic = ForumTopic(
+            id=11, date=None, peer=PeerChannel(123), title="Announcements", icon_color=0,
+            top_message=99, read_inbox_max_id=80, read_outbox_max_id=0,
+            unread_count=3, unread_mentions_count=0, unread_reactions_count=0,
+            unread_poll_votes_count=0, from_id=PeerUser(1), notify_settings=PeerNotifySettings(),
+            pinned=True, closed=False,
+        )
+        class Client:
+            requests = []
+
+            async def get_entity(self, peer):
+                return entity
+
+            async def __call__(self, request):
+                self.requests.append(request)
+                return SimpleNamespace(topics=[topic, ForumTopicDeleted(id=12)])
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.topics(SimpleNamespace(query_params={}), scope="a" * 32, peer="@group", limit=12)
+            entity.forum = False
+            nonforum = MODULE.topics(SimpleNamespace(query_params={}), scope="a" * 32, peer="@group", limit=12)
+
+        self.assertEqual(type(client.requests[0]).__name__, "GetForumTopicsRequest")
+        self.assertEqual(client.requests[0].limit, 12)
+        self.assertEqual(result["topics"], [{
+            "id": 11, "title": "Announcements", "topMessage": 99,
+            "readInboxMaxId": 80, "unread": 3, "pinned": True, "closed": False,
+        }])
+        self.assertEqual(json.loads(json.dumps(result))["isForum"], True)
+        self.assertEqual(nonforum, {"peer": "Test Group", "isForum": False, "topics": [], "me": "Me"})
+        self.assertEqual(len(client.requests), 1, "non-forum chats must not issue forum-topic RPCs")
+
+    def test_topics_preserve_safe_peer_not_found_error(self):
+        class Client:
+            async def get_entity(self, peer):
+                raise ValueError("missing peer")
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                MODULE.topics(SimpleNamespace(query_params={}), scope="a" * 32, peer="@missing", limit=12)
+        self.assertEqual(raised.exception.status_code, 404)
+
+
 class ForcedRefreshRouteTests(unittest.TestCase):
+    def test_all_folder_collects_dialogs_from_the_client(self):
+        scope = "b" * 32
+        entity = SimpleNamespace(id=456, title="Test Group", username="group", forum=False)
+        dialog = SimpleNamespace(
+            id=456, entity=entity, unread_count=2, folder_id=None, date=None,
+            message=SimpleNamespace(id=9), dialog=SimpleNamespace(notify_settings=None),
+        )
+
+        class Client:
+            async def iter_dialogs(self, limit):
+                self.limit = limit
+                yield dialog
+
+            async def __call__(self, request):
+                self.request = request
+                return SimpleNamespace(filters=[])
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.dialogs(
+                SimpleNamespace(query_params={}), scope=scope, limit=40,
+                folder="all", unreadOnly=False, refresh=True,
+            )
+        self.assertEqual(result["activeFolder"], "all")
+        self.assertEqual([row["name"] for row in result["dialogs"]], ["Test Group"])
+        self.assertEqual(client.limit, MODULE._DIALOG_SNAPSHOT_LIMIT)
+        self.assertEqual(type(client.request).__name__, "GetDialogFiltersRequest")
+
     def test_refresh_true_bypasses_cached_snapshot(self):
         MODULE._DIALOG_CACHE.clear()
         scope = "a" * 32

@@ -95,6 +95,70 @@ function loadFunction(name, nextName, prefix = '') {
 
 const defaults = 'const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: \'all\' })\nconst settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`'
 
+function makeTelegramPane(dialogs, messages = []) {
+  const slots = []
+  const restCalls = []
+  let slot = 0
+  const jsx = (type, props = {}, key) => ({ type, props, key })
+  const useState = initial => {
+    const index = slot++
+    if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial
+    return [slots[index], value => { slots[index] = typeof value === 'function' ? value(slots[index]) : value }]
+  }
+  const useRef = initial => {
+    const index = slot++
+    if (!(index in slots)) slots[index] = { current: initial }
+    return slots[index]
+  }
+  const useEffect = () => { slot++ }
+  const useQuery = ({ queryKey }) => queryKey.includes('dialogs')
+    ? { data: { dialogs, folders: [{ id: 'all', title: 'All' }] }, isPending: false, isError: false, isFetching: false }
+    : { data: { topics: [], messages }, isPending: false, isError: false, isFetching: false }
+  const useMutation = ({ mutationFn }) => ({ isPending: false, reset() {}, mutateAsync: mutationFn })
+  const testScope = 's'.repeat(32)
+  const rest = async (path, options = {}) => {
+    restCalls.push({ path, options })
+    if (path === '/actions/prepare') return { scope: testScope, confirmationToken: 'token', preview: {} }
+    if (path === '/actions/commit') return { status: 'verified', peer: '@alice' }
+    return {}
+  }
+  const badgeSource = source.slice(source.indexOf('export function unreadBadge('), source.indexOf('\nexport function filterDialogs('))
+  const badge = new Function('jsx', `${badgeSource.replace('export function unreadBadge', 'function unreadBadge')}\nreturn unreadBadge`)(jsx)
+  const componentStart = source.indexOf('function TelegramPane(')
+  const componentEnd = source.indexOf('\nfunction Connected(', componentStart)
+  const paneSource = source.slice(componentStart, componentEnd)
+  // Only trusted repo source is compiled; dialog fixtures never enter function text.
+  const Pane = new Function(
+    'jsx', 'jsxs', 'useState', 'useRef', 'useEffect', 'useQueryClient', 'useQuery', 'useMutation',
+    'loadSettings', 'settingsKey', 'filterDialogs', 'unreadBadge', 'renderMediaPreview', 'senderName', 'shortDate',
+    'action', 'note', 'stack', 'row', 'text', 'muted', 'buildTmeLink', 'buildMarkReadAction', 'consumeDialogsRequestPath',
+    'Button', 'Dialog', 'DialogContent', 'DialogHeader', 'DialogTitle', 'DialogDescription', 'DialogFooter',
+    'Field', 'SafeHtml', 'Confirmation',
+    `${paneSource}\nlet mountId = 0\nreturn TelegramPane`,
+  )(
+    jsx, jsx, useState, useRef, useEffect, () => ({ invalidateQueries() {} }), useQuery, useMutation,
+    loadFunction('loadSettings', 'unreadBadge', defaults), (profile, me) => `telegram-settings:${profile}:${me}`,
+    loadFunction('filterDialogs', 'Confirmation'), badge,
+    loadFunction('renderMediaPreview', 'filterDialogs', 'const jsx = (type, props) => ({ type, props })'),
+    loadFunction('senderName', 'shortDate'), loadFunction('shortDate', 'contextText'),
+    (label, onClick, disabled = false, extra = {}) => jsx('button', { type: 'button', onClick, disabled, ...extra, children: label }),
+    (message, isError = false) => jsx('div', { role: isError ? 'alert' : 'note', children: message }),
+    {}, {}, {}, {}, () => null, loadFunction('buildMarkReadAction', 'TEXT_LIMIT'), () => '/dialogs?limit=40&refresh=0',
+    'button', 'Dialog', 'DialogContent', 'DialogHeader', 'DialogTitle', 'DialogDescription', 'DialogFooter',
+    'Field', 'SafeHtml', 'Confirmation',
+  )
+  const render = () => {
+    slot = 0
+    return Pane({
+      ctx: { storage: { get: () => null, set() {} }, os: { openExternal() {} }, rest },
+      identity: { scope: testScope, me: 'Me' }, profile: 'default', queryPrefix: ['test'],
+      statusUnavailable: false, retryButton: null,
+    })
+  }
+  render.restCalls = () => restCalls
+  return render
+}
+
 test('settings default to manual refresh', () => {
   const load = loadFunction('loadSettings', 'unreadBadge', defaults)
   assert.deepEqual(load({ get: () => null }, 'k'), { autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: 'all' })
@@ -148,6 +212,74 @@ test('folder tabs remain horizontally scrollable in a constrained narrow header'
   assert.match(header, /\.\.\.stack, width: '100%', minWidth: 0/)
 })
 
+test('folder scrollport translates vertical wheel and drags only its gaps', () => {
+  const render = makeTelegramPane([])
+  const nodes = tree => {
+    if (Array.isArray(tree)) return tree.flatMap(nodes)
+    return tree && typeof tree === 'object'
+      ? [tree, ...nodes(tree.props?.children)]
+      : []
+  }
+  const tablist = nodes(render()).find(node => node.props?.role === 'tablist')
+  const scroll = {
+    scrollLeft: 10, scrollWidth: 400, clientWidth: 100,
+    setPointerCapture(id) { this.captured = id },
+    releasePointerCapture(id) { this.released = id },
+  }
+  let prevented = false
+  tablist.props.onWheel({ currentTarget: scroll, deltaX: 0, deltaY: 30, preventDefault() { prevented = true } })
+  assert.equal(scroll.scrollLeft, 40)
+  assert.equal(prevented, true)
+  prevented = false
+  tablist.props.onWheel({ currentTarget: scroll, deltaX: 12, deltaY: 0, preventDefault() { prevented = true } })
+  assert.equal(scroll.scrollLeft, 40, 'native horizontal trackpad input remains untouched')
+  assert.equal(prevented, false)
+  tablist.props.onPointerDown({ button: 0, pointerId: 4, clientX: 100, target: { closest: () => null }, currentTarget: scroll })
+  tablist.props.onPointerMove({ pointerId: 4, clientX: 80, currentTarget: scroll })
+  assert.equal(scroll.scrollLeft, 60)
+  tablist.props.onPointerUp({ pointerId: 4, currentTarget: scroll })
+  assert.equal(scroll.released, 4)
+  tablist.props.onPointerDown({ button: 0, pointerId: 5, clientX: 100, target: { closest: () => ({}) }, currentTarget: scroll })
+  tablist.props.onPointerMove({ pointerId: 5, clientX: 40, currentTarget: scroll })
+  assert.equal(scroll.scrollLeft, 60, 'dragging over a tab leaves its click target undisturbed')
+  assert.equal(tablist.props.onKeyDown instanceof Function, true)
+})
+
+test('manual refresh is forced exactly once without changing automatic refresh behavior', () => {
+  const consume = loadFunction('consumeDialogsRequestPath', 'buildMarkReadAction')
+  const force = { current: true }
+  assert.equal(consume(force), '/dialogs?limit=40&refresh=1')
+  assert.equal(force.current, false)
+  assert.equal(consume(force), '/dialogs?limit=40&refresh=0')
+  assert.ok(/const forcedNextDialogsRefresh = useRef\(false\)/.test(source), 'manual refresh uses a one-shot ref')
+  assert.ok(/refreshAll\(true\)/.test(source), 'manual refresh forces the backend cache bypass')
+  assert.ok(/action\('Retry', \(\) => \{ void refreshAll\(true\) \}/.test(source), 'dialog retry also forces a fresh snapshot')
+})
+
+test('mark-read actions preserve the selected post and forum topic ID', () => {
+  const create = loadFunction('buildMarkReadAction', 'TEXT_LIMIT')
+  assert.deepEqual(create('@group', 321), { action: 'mark-read', peer: '@group', maxId: 321, topicId: 0 })
+  assert.deepEqual(create('id:-100123', 777, 55), { action: 'mark-read', peer: 'id:-100123', maxId: 777, topicId: 55 })
+  assert.equal(create('@group', 321, 1), null, 'General forum topic read must fail closed')
+  assert.equal(create('@group', 0), null)
+  assert.equal(create('', 321), null)
+  assert.doesNotMatch(source, /\/dialogs\/mark-read/)
+  assert.ok(/function requestMarkRead\(maxId, selectedTopicId = 0\)[\s\S]*?buildMarkReadAction\(dialogKey, maxId, selectedTopicId\)[\s\S]*?prepareAndConfirm\(body\)/.test(source), 'mark-read uses the prepare/confirm flow')
+  assert.ok(/Mark whole forum read/.test(source), 'whole-forum action is explicit')
+  assert.ok(/action\('Mark read up to here', \(\) => \{ void requestMarkRead\(message\.id, topicId\) \}/.test(source), 'message action preserves its selected ID')
+  assert.ok(/requestMarkRead\(activeDialog\.topMessageId, 0\)/.test(source), 'chat action uses the visible chat ceiling')
+})
+
+test('forum topics are fetched by stable ID and selected before their messages are loaded', () => {
+  assert.ok(/read\('\/topics\?' \+ new URLSearchParams\(\{ peer: dialogKey, limit: '50' \}\)\)/.test(source), 'topics use the explicit peer')
+  assert.ok(/enabled: !!dialogKey && !!activeDialog\?\.isForum/.test(source), 'topics load only for forum dialogs')
+  assert.ok(/topicId > 0/.test(source), 'topic ID scopes message loading')
+  assert.ok(/setTopicId\(topic\.id\)/.test(source), 'selection preserves the stable topic ID')
+  assert.ok(/topic\.title/.test(source), 'selected topic title is visible')
+  assert.ok(/action\('Reply', \(\) => setCompose\(\{ peer: dialogKey, messageId: message\.id, message: '' \}\), waiting\)/.test(source), 'forum messages retain their message-targeted reply action')
+  assert.equal(/!activeDialog\?\.isForum && action\('Reply'/.test(source), false, 'the topic selection must not suppress message replies')
+})
+
 test('safe Telegram image previews render as bounded lazy images', () => {
   const render = loadFunction('renderMediaPreview', 'filterDialogs', 'const jsx = (type, props) => ({ type, props })')
   const src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB'
@@ -160,6 +292,71 @@ test('safe Telegram image previews render as bounded lazy images', () => {
   assert.equal(render({ mediaPreview: `data:image/png;base64,${'A'.repeat(88000)}` }), null)
 })
 
+test('unmuted switch changes and restores the rendered dialog rows in the same folder', () => {
+  const render = makeTelegramPane([
+    { key: '@alice', name: 'Alice', muted: false, unread: 0, folderIds: ['all'] },
+    { key: '@quiet', name: 'Quiet group', muted: true, unread: 0, folderIds: ['all'] },
+  ])
+  const nodes = tree => {
+    const result = []
+    const visit = node => {
+      if (Array.isArray(node)) return node.forEach(visit)
+      if (!node || typeof node !== 'object') return
+      result.push(node)
+      visit(node.props?.children)
+    }
+    visit(tree)
+    return result
+  }
+  const dialogNames = tree => nodes(tree)
+    .filter(node => node.type === 'button' && Array.isArray(node.props.children) && !node.props['aria-label'])
+    .map(node => node.props.children[0]?.props?.children)
+  const toggle = tree => nodes(tree).find(node => node.type === 'button' && node.props.role === 'switch' && String(node.props.children).includes('Unmuted only'))
+
+  let tree = render()
+  assert.deepEqual(dialogNames(tree), ['Alice', '🔇 Quiet group'])
+  toggle(tree).props.onClick()
+  tree = render()
+  assert.equal(toggle(tree).props['aria-checked'], true)
+  assert.deepEqual(dialogNames(tree), ['Alice'])
+  toggle(tree).props.onClick()
+  tree = render()
+  assert.equal(toggle(tree).props['aria-checked'], false)
+  assert.deepEqual(dialogNames(tree), ['Alice', '🔇 Quiet group'])
+  assert.ok(/queryKey: \[\.\.\.queryPrefix, scope, 'dialogs', folder, unreadOnly, settings\.unmutedOnly\]/.test(source))
+  assert.ok(/params\.unmutedOnly = String\(settings\.unmutedOnly\)/.test(source))
+  assert.ok(/placeholderData: previous => previous/.test(source))
+})
+
+test('mark-read UI prepares exact targets and commits only after confirmation', async () => {
+  const render = makeTelegramPane([
+    { key: '@alice', name: 'Alice', muted: false, unread: 2, topMessageId: 42, folderIds: ['all'] },
+  ], [{ id: 15, date: '', mine: false, sender: 'Bob', htmlPreview: 'target', media: '', replyTo: null }])
+  const treeNodes = tree => Array.isArray(tree) ? tree.flatMap(treeNodes)
+    : tree && typeof tree === 'object' ? [tree, ...treeNodes(tree.props?.children)] : []
+  let tree = render()
+  treeNodes(tree).find(node => node.type === 'button' && Array.isArray(node.props.children)
+    && node.props.children[0]?.props?.children === 'Alice').props.onClick()
+  tree = render()
+  treeNodes(tree).find(node => node.type === 'button' && node.props.children === 'Mark read up to here').props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(render.restCalls().map(call => call.path), ['/actions/prepare'])
+  assert.deepEqual(render.restCalls()[0].options.body, {
+    scope: 's'.repeat(32), action: 'mark-read', peer: '@alice', maxId: 15, topicId: 0,
+  })
+  treeNodes(render()).find(node => node.type === 'Confirmation').props.onCancel()
+  tree = render()
+  treeNodes(tree).find(node => node.type === 'button' && node.props.children === 'Mark chat as read').props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(render.restCalls().map(call => call.path), ['/actions/prepare', '/actions/prepare'])
+  assert.equal(render.restCalls()[1].options.body.maxId, 42)
+  tree = render()
+  const confirmation = treeNodes(tree).find(node => node.type === 'Confirmation')
+  assert.ok(confirmation?.props.ticket)
+  await confirmation.props.onConfirm()
+  assert.deepEqual(render.restCalls().map(call => call.path), ['/actions/prepare', '/actions/prepare', '/actions/commit'])
+})
+
 test('dialog tabs filter by backend-returned stable folder IDs', () => {
   const filter = loadFunction('filterDialogs', 'Confirmation')
   const rows = [
@@ -168,13 +365,15 @@ test('dialog tabs filter by backend-returned stable folder IDs', () => {
     { key: '@c', unread: 9, muted: true, folderIds: ['all', 'unread'] },
     { key: '@d', unread: 2, muted: true, folderIds: ['archive', 'unread'] },
   ]
-  assert.equal(filter(rows, 'all', false).length, 3)
-  assert.deepEqual(filter(rows, 'all', false, true).map(d => d.key), ['@b', '@c'])
+  const allRows = filter(rows, 'all', false).map(d => d.key)
+  assert.deepEqual(allRows, ['@a', '@b', '@c'])
+  assert.deepEqual(filter(rows, 'all', true).map(d => d.key), ['@a', '@b'])
+  assert.deepEqual(filter(rows, 'all', false).map(d => d.key), allRows, 'turning the filter off restores muted rows in the same folder')
+  assert.ok(/const visibleDialogs = filterDialogs\(dialogsList, selectedTab, settings\.unmutedOnly\)/.test(source), 'the toggle state feeds the rendered dialog list')
   assert.deepEqual(filter(rows, 'unread', false).map(d => d.key), ['@b', '@c', '@d'])
   assert.deepEqual(filter(rows, '7', false).map(d => d.key), ['@a'])
   assert.deepEqual(filter(rows, '8', false).map(d => d.key), ['@b'])
   assert.deepEqual(filter(rows, 'archive', false).map(d => d.key), ['@d'])
-  assert.deepEqual(filter(rows, 'all', true).map(d => d.key), ['@a', '@b'])
   assert.deepEqual(filter(rows, 'all', true, true).map(d => d.key), ['@b'])
   assert.equal(filter(null, 'all', false).length, 0)
   assert.equal(filter([null, false, 'x'], 'all', false).length, 0)

@@ -5,11 +5,10 @@ from __future__ import annotations
 import importlib.util
 import asyncio
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
@@ -51,46 +50,15 @@ def fake_dialog(mid: int, raw_id: int, top_id: int, unread: int = 5) -> SimpleNa
     )
 
 
-class MarkReadMarkedIdTests(unittest.TestCase):
-    def test_bounded_read_uses_marked_id_and_cursor_ceiling(self):
-        client = AsyncMock()
-        client.get_me = AsyncMock(return_value=SimpleNamespace(id=999))
+class ReadCursorHelpersTests(unittest.TestCase):
+    def test_dialog_match_and_read_cursor_use_the_telethon_dialog(self):
         entity = channel_entity(-1001234567890)
-        # Telethon custom Dialog.id is the marked id; raw entity.id differs.
         dialog = fake_dialog(
-            mid=MODULE._peer_identity(entity), raw_id=entity.id, top_id=4002)
-        client.get_dialogs = AsyncMock(return_value=[dialog])
-        calls = {}
-
-        async def send_read_acknowledge(peer, max_id=None):
-            calls["peer"] = peer
-            calls["max_id"] = max_id
-
-        client.send_read_acknowledge = send_read_acknowledge
-
-        # Real helpers: dialog matching by marked id, ceiling from top message.
-        found = asyncio.run(MODULE._find_dialog(client, entity))
-        self.assertIsNotNone(found, "dialog must be found by marked id")
-        ceiling = MODULE._dialog_read_ceiling(found)
-        self.assertGreaterEqual(ceiling, 4002,
-                                "ceiling must come from the matched dialog top message")
-        async def commit_read(inner_client):
-            await inner_client.send_read_acknowledge(entity, max_id=ceiling)
-
-        async def main():
-            await commit_read(client)
-
-        asyncio.run(main())
-        self.assertEqual(calls["max_id"], 4002)
-
-    def test_fresh_cursor_readback_passes_when_newer_unread_remain(self):
-        # After max_id commit, read cursor must have advanced through the
-        # target while unread_count may still be > 0 (newer posts).
-        target_id = 4002
-        fresh = fake_dialog(mid=R, raw_id=-1001234567890, top_id=4010, unread=2)
-        fresh.dialog.read_inbox_max_id = target_id
-        self.assertGreaterEqual(MODULE._dialog_read_cursor(fresh), target_id)
-        self.assertGreater(fresh.unread_count, 0)
+            mid=MODULE._peer_identity(entity), raw_id=entity.id, top_id=4002, unread=2,
+        )
+        self.assertTrue(MODULE._dialog_match(dialog, entity), "marked dialog ID resolves the chat")
+        self.assertEqual(MODULE._dialog_read_cursor(dialog), 3999)
+        self.assertEqual(dialog.unread_count, 2, "newer unread messages may remain beyond the cursor")
 
 
 class ForcedRefreshTests(unittest.TestCase):

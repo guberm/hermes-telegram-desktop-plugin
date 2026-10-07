@@ -22,6 +22,19 @@ export function buildTmeLink(peerKey) {
   return null
 }
 
+export function consumeDialogsRequestPath(forceRef) {
+  const refresh = forceRef.current === true
+  forceRef.current = false
+  return `/dialogs?limit=40&refresh=${refresh ? '1' : '0'}`
+}
+
+export function buildMarkReadAction(peer, maxId, topicId = 0) {
+  if (typeof peer !== 'string' || !peer.trim()) return null
+  if (!Number.isSafeInteger(maxId) || maxId < 1 || maxId > 10_000_000_000) return null
+  if (!Number.isSafeInteger(topicId) || topicId < 0 || topicId > 10_000_000_000 || topicId === 1) return null
+  return { action: 'mark-read', peer, maxId, topicId }
+}
+
 const TEXT_LIMIT = 4096
 
 const stack = { display: 'flex', flexDirection: 'column', gap: '0.75rem', minWidth: 0 }
@@ -517,45 +530,49 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     if (path.startsWith('/dialogs?')) {
       params.folder = folder
       params.unreadOnly = String(unreadOnly)
+      params.unmutedOnly = String(settings.unmutedOnly)
       if (new URLSearchParams(path.split('?')[1] || '').get('refresh') === '1') params.refresh = '1'
     }
     return ctx.rest(path + (path.includes('?') ? '&' : '?') + new URLSearchParams(params), { timeoutMs: 60000 })
   }
-  const [forceDialogsRefresh, setForceDialogsRefresh] = useState(0)
+  const forcedNextDialogsRefresh = useRef(false)
+  const folderDrag = useRef(null)
   const dialogsQuery = useQuery({
-    queryKey: [...queryPrefix, scope, 'dialogs', folder, unreadOnly, forceDialogsRefresh],
-    queryFn: () => read('/dialogs?limit=40&refresh=' + (forceDialogsRefresh > 0 ? '1' : '0')),
+    queryKey: [...queryPrefix, scope, 'dialogs', folder, unreadOnly, settings.unmutedOnly],
+    queryFn: () => read(consumeDialogsRequestPath(forcedNextDialogsRefresh)),
+    placeholderData: previous => previous,
     refetchInterval: settings.autoRefresh ? 60000 : false,
     enabled: !statusUnavailable,
   })
+  const dialogsList = Array.isArray(dialogsQuery.data?.dialogs) ? dialogsQuery.data.dialogs : []
+  const activeDialog = dialogsList.find(dialog => dialog.key === dialogKey)
+  const topicsQuery = useQuery({
+    queryKey: [...queryPrefix, scope, 'topics', dialogKey],
+    queryFn: () => read('/topics?' + new URLSearchParams({ peer: dialogKey, limit: '50' })),
+    enabled: !!dialogKey && !!activeDialog?.isForum && topicId === 0 && !statusUnavailable,
+    refetchInterval: settings.autoRefresh ? 60000 : false,
+  })
+  const topicsList = Array.isArray(topicsQuery.data?.topics) ? topicsQuery.data.topics : []
+  const activeTopic = topicsList.find(topic => topic.id === topicId)
+  const showTopics = !!activeDialog?.isForum && topicId === 0
   const messagesQuery = useQuery({
     queryKey: [...queryPrefix, scope, 'messages', dialogKey, topicId],
     queryFn: () => read('/messages?' + new URLSearchParams({ peer: dialogKey, limit: '30', topicId: String(topicId) })),
-    enabled: !!dialogKey && !statusUnavailable,
+    enabled: !!dialogKey && !statusUnavailable && (!activeDialog?.isForum || topicId > 0),
     refetchInterval: settings.autoRefresh ? 60000 : false,
   })
-  const mutation = useMutation({ retry: false, gcTime: 0, mutationFn: ({ path, body }) => ctx.rest(path, { method: 'POST', body, timeoutMs: 60000 }) })
-  const dialogsList = Array.isArray(dialogsQuery.data?.dialogs) ? dialogsQuery.data.dialogs : []
   const messagesList = Array.isArray(messagesQuery.data?.messages) ? messagesQuery.data.messages : []
-  const activeDialog = dialogsList.find(dialog => dialog.key === dialogKey)
+  const mutation = useMutation({ retry: false, gcTime: 0, mutationFn: ({ path, body }) => ctx.rest(path, { method: 'POST', body, timeoutMs: 60000 }) })
 
-  function refreshAll() {
-    void client.invalidateQueries({ queryKey: [...queryPrefix, scope] })
+  function refreshAll(forceDialogs = false) {
+    if (forceDialogs) forcedNextDialogsRefresh.current = true
+    return client.invalidateQueries({ queryKey: [...queryPrefix, scope] })
   }
 
-  async function markDialogRead(dialog) {
-    if (guard.current || statusUnavailable || !dialog?.key || !(dialog.unread > 0)) return
-    guard.current = true; setBusy(true); setFeedback(null)
-    try {
-      const result = await ctx.rest('/dialogs/mark-read', { method: 'POST', body: { peer: dialog.key }, timeoutMs: 60000 })
-      if (result?.status !== 'verified') throw new Error('Unverified read state')
-      if (mounted.current) {
-        setFeedback({ text: `Marked as read: ${result.peer || dialog.key}` })
-        refreshAll()
-      }
-    } catch (e) {
-      if (mounted.current) setFeedback({ error: true, text: `Could not mark as read. ${errorText(e)}` })
-    } finally { guard.current = false; if (mounted.current) setBusy(false) }
+  function requestMarkRead(maxId, selectedTopicId = 0) {
+    const body = buildMarkReadAction(dialogKey, maxId, selectedTopicId)
+    if (!body) return
+    return prepareAndConfirm(body)
   }
 
   async function prepareAndConfirm(body) {
@@ -582,7 +599,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
       if (mounted.current) {
         setTicket(null)
         setFeedback({ text: `Done: ${result.status} (${result.peer || ''})` })
-        refreshAll()
+        refreshAll(true)
       }
       return result
     } catch (error) {
@@ -621,9 +638,39 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
       tabs[nextIndex].focus()
       tabs[nextIndex].click()
     },
+    onWheel: event => {
+      if (event.deltaX !== 0 || !event.deltaY) return
+      const area = event.currentTarget
+      const maxScroll = Math.max(0, area.scrollWidth - area.clientWidth)
+      const next = Math.max(0, Math.min(maxScroll, area.scrollLeft + event.deltaY))
+      if (next === area.scrollLeft) return
+      event.preventDefault()
+      area.scrollLeft = next
+    },
+    onPointerDown: event => {
+      if (event.button !== 0 || event.target.closest?.('[role="tab"]')) return
+      folderDrag.current = { pointerId: event.pointerId, startX: event.clientX, startLeft: event.currentTarget.scrollLeft }
+      event.currentTarget.setPointerCapture?.(event.pointerId)
+    },
+    onPointerMove: event => {
+      const drag = folderDrag.current
+      if (drag?.pointerId === event.pointerId) {
+        event.currentTarget.scrollLeft = drag.startLeft + drag.startX - event.clientX
+      }
+    },
+    onPointerUp: event => {
+      if (folderDrag.current?.pointerId !== event.pointerId) return
+      event.currentTarget.releasePointerCapture?.(event.pointerId)
+      folderDrag.current = null
+    },
+    onPointerCancel: event => {
+      if (folderDrag.current?.pointerId !== event.pointerId) return
+      event.currentTarget.releasePointerCapture?.(event.pointerId)
+      folderDrag.current = null
+    },
     style: {
     ...row, gap: '0.25rem', minWidth: 0, width: '100%', maxWidth: '100%', boxSizing: 'border-box',
-    overflowX: 'auto', overflowY: 'hidden', flexWrap: 'nowrap', scrollbarWidth: 'thin', overscrollBehaviorX: 'contain',
+    overflowX: 'auto', overflowY: 'hidden', flexWrap: 'nowrap', scrollbarWidth: 'thin', overscrollBehaviorX: 'contain', cursor: 'grab',
   }, children:
     folderTabs.map(folder => jsx('button', {
       type: 'button', role: 'tab', 'aria-selected': selectedTab === folder.id,
@@ -644,8 +691,9 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
       jsxs('div', { style: { ...row, justifyContent: 'space-between', flexWrap: 'wrap', minWidth: 0 }, children: [
         jsx('strong', { children: `Telegram — ${me}` }),
         jsxs('div', { style: { ...row, flexWrap: 'wrap' }, children: [
-          action(settings.autoRefresh ? 'Turn off auto-refresh' : 'Auto-refresh (60s)', () =>
+        action(settings.autoRefresh ? 'Turn off auto-refresh' : 'Auto-refresh (60s)', () =>
             setSettings(current => ({ ...current, autoRefresh: !current.autoRefresh })), false),
+          action(dialogsQuery.isFetching ? 'Refreshing…' : 'Refresh', () => { void refreshAll(true) }, dialogsQuery.isFetching || waiting),
           action('New message', () => beginCompose(''), waiting)
         ] })
       ] }),
@@ -679,7 +727,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     dialogsQuery.isPending && note('Loading dialogs…'),
     dialogsQuery.isError && jsxs('div', { children: [
       note('Could not load Telegram dialogs. The backend resolves the active profile session; check the Hermes log and retry.', true),
-      action('Retry', () => dialogsQuery.refetch(), dialogsQuery.isFetching, { ref: retryButton })
+      action('Retry', () => { void refreshAll(true) }, dialogsQuery.isFetching, { ref: retryButton })
     ] }),
     jsxs('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(12rem, 1fr) minmax(0, 2fr)', gap: '0.75rem', flex: '1 1 auto', minHeight: 0 }, children: [
         jsx('div', { 'aria-label': 'Dialogs', style: { ...stack, overflow: 'auto', maxHeight: '70vh', border: '1px solid var(--ui-stroke-secondary)', borderRadius: '0.4rem', padding: '0.25rem' },
@@ -693,10 +741,6 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             },
             children: [
               jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: dialog.unread > 0 && !dialog.muted ? 700 : 400 }, children: `${dialog.muted ? '🔇 ' : ''}${dialog.name || dialog.key}` }),
-              dialog.unread > 0 && action('Mark as read', () => { void markDialogRead(dialog) }, waiting, {
-                title: 'Mark this chat as read (advances the read pointer to its newest message)',
-                style: { padding: '0.15rem 0.5rem', fontSize: '0.75rem', flexShrink: 0 },
-              }),
               unreadBadge(dialog.unread, dialog.muted),
             ]
           }, dialog.key))
@@ -704,16 +748,48 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
         jsxs('div', { 'aria-label': 'Message history', style: { ...stack, overflow: 'auto', maxHeight: '70vh', border: '1px solid var(--ui-stroke-secondary)', borderRadius: '0.4rem', padding: '0.5rem' }, children: [
           !dialogKey && note('Select a dialog to read its recent messages.'),
           dialogKey && jsxs('div', { style: { ...row, justifyContent: 'space-between' }, children: [
-            jsx('strong', { children: activeDialog?.name || dialogKey }),
+            jsx('strong', { children: activeTopic
+              ? `${activeDialog?.name || dialogKey} · ${activeTopic.title}`
+              : activeDialog?.name || dialogKey }),
             jsxs('div', { style: row, children: [
               buildTmeLink(dialogKey) && action('Open in browser', () => { void ctx.os.openExternal(buildTmeLink(dialogKey)) }, false),
-              topicId ? action('Exit topic', () => setTopicId(0), waiting) : null,
-              action('Reply here', () => beginCompose(dialogKey), waiting)
+              topicId > 0 && activeDialog?.isForum ? action('Back to topics', () => setTopicId(0), waiting) : null,
+              activeDialog?.unread > 0 && activeDialog?.topMessageId > 0 && action(
+                activeDialog.isForum ? 'Mark whole forum read' : 'Mark chat as read',
+                () => { void requestMarkRead(activeDialog.topMessageId, 0) }, waiting,
+                { title: 'Review and confirm the exact latest message before changing read state' },
+              ),
+              !activeDialog?.isForum && action('Reply here', () => beginCompose(dialogKey), waiting)
             ] })
           ] }),
-          dialogKey && messagesQuery.isFetching && note('Loading messages…'),
-          dialogKey && messagesQuery.isError && note('Could not load this dialog history. Retry or pick another dialog.', true),
-          messagesList.map(message => jsxs('article', { style: {
+          showTopics && topicsQuery.isPending && note('Loading forum topics…'),
+          showTopics && topicsQuery.isError && jsxs('div', { children: [
+            note('Could not load forum topics. Retry the topics request.', true),
+            action('Retry topics', () => topicsQuery.refetch(), topicsQuery.isFetching)
+          ] }),
+          showTopics && !topicsQuery.isPending && !topicsQuery.isError && topicsList.length === 0 && note('No forum topics were returned.'),
+          showTopics && topicsList.map(topic => jsx('button', {
+            type: 'button', 'aria-label': `Open topic ${topic.title || topic.id}`,
+            onClick: () => setTopicId(topic.id),
+            style: {
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem',
+              padding: '0.55rem 0.65rem', border: '1px solid var(--ui-stroke-secondary)',
+              borderRadius: '0.4rem', background: 'transparent', color: 'inherit', font: 'inherit',
+              textAlign: 'left', cursor: 'pointer', minWidth: 0,
+            },
+            children: [
+              jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: topic.title || `Topic ${topic.id}` }),
+              topic.closed && jsx('span', { style: muted, children: 'Closed' }),
+              topic.unread > 0 && unreadBadge(topic.unread, false),
+            ]
+          }, String(topic.id))),
+          topicId === 1 && note('General is part of the forum-wide read cursor. To avoid marking other topics read, use “Mark whole forum read” or leave it unchanged.'),
+          !showTopics && messagesQuery.isFetching && note('Loading messages…'),
+          !showTopics && messagesQuery.isError && jsxs('div', { children: [
+            note('Could not load this dialog history. Retry or pick another dialog.', true),
+            action('Retry messages', () => messagesQuery.refetch(), messagesQuery.isFetching)
+          ] }),
+          !showTopics && messagesList.map(message => jsxs('article', { style: {
             border: '1px solid var(--ui-stroke-secondary)', borderRadius: '0.5rem', padding: '0.5rem 0.6rem',
             display: 'flex', flexDirection: 'column', gap: '0.2rem',
           }, children: [
@@ -730,6 +806,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             renderMediaPreview(message),
             jsxs('div', { style: row, children: [
               action('Reply', () => setCompose({ peer: dialogKey, messageId: message.id, message: '' }), waiting),
+              topicId !== 1 && action('Mark read up to here', () => { void requestMarkRead(message.id, topicId) }, waiting),
               action('Delete', () => prepareAndConfirm({ action: 'delete', peer: dialogKey, messageId: message.id }),
                 waiting || !message.mine),
               message.replyTo && jsx('span', { style: muted, children: `↩ ${message.replyTo}` })

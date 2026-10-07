@@ -60,7 +60,8 @@ class ShippedSourceContractTests(unittest.TestCase):
     def test_readback_verifications_exist(self):
         self.assertIn("sent message mismatch", self.backend_text)
         self.assertIn("delete readback mismatch", self.backend_text)
-        self.assertIn("read state mismatch", self.backend_text)
+        self.assertIn("read cursor did not advance through the requested message", self.backend_text)
+        self.assertIn('"readCursor": cursor', self.backend_text)
 
     def test_desktop_wires_route_nav_palette_and_confirm(self):
         self.assertIn("ROUTES_AREA", self.plugin_text)

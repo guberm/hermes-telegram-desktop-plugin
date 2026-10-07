@@ -115,10 +115,6 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-class _MarkReadBody(_StrictModel):
-    peer: Annotated[str, StringConstraints(min_length=1, max_length=256)]
-
-
 class SendPrepare(_StrictModel):
     scope: ScopeText
     action: Literal["send"]
@@ -139,6 +135,7 @@ class MarkReadPrepare(_StrictModel):
     action: Literal["mark-read"]
     peer: Annotated[str, StringConstraints(min_length=1, max_length=256)]
     maxId: int = Field(ge=1, le=10_000_000_000)
+    topicId: int = Field(default=0, ge=0, le=10_000_000_000)
 
 
 class DeletePrepare(_StrictModel):
@@ -368,6 +365,30 @@ def _message_has_image_media(message: Any) -> bool:
     return mime_type in {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 
+def _message_is_general_topic(message: Any) -> bool:
+    reply = getattr(message, "reply_to", None)
+    topic_root_id = getattr(reply, "reply_to_top_id", None)
+    if topic_root_id and int(topic_root_id) != 1:
+        return False
+    action = getattr(message, "action", None)
+    if action is not None:
+        from telethon.tl.types import MessageActionTopicCreate
+
+        if isinstance(action, MessageActionTopicCreate):
+            return False
+    return True
+
+
+def _message_belongs_to_forum_topic(message: Any, topic_id: int) -> bool:
+    if int(getattr(message, "id", 0) or 0) == topic_id:
+        return True
+    reply = getattr(message, "reply_to", None)
+    top_id = getattr(reply, "reply_to_top_id", None)
+    if top_id:
+        return int(top_id) == topic_id
+    return int(getattr(reply, "reply_to_msg_id", 0) or 0) == topic_id
+
+
 def _public_message(message: Any, me_id: int) -> dict[str, Any]:
     sender = message.sender
     sender_name = ""
@@ -398,6 +419,7 @@ def _public_message(message: Any, me_id: int) -> dict[str, Any]:
         "htmlPreview": html_preview,
         "media": media_kind,
         "replyTo": int(message.reply_to.reply_to_msg_id) if message.reply_to else None,
+        "replyToTop": int(message.reply_to.reply_to_top_id) if getattr(message.reply_to, "reply_to_top_id", None) else None,
         "mine": bool(message.out) or (message.sender_id == me_id if message.sender_id is not None else False),
     }
 
@@ -562,7 +584,10 @@ def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any]) -> tu
     return folders, rows
 
 
-def _dialog_page(data: dict[str, Any], requested_folder: str, limit: int, unread_only: bool = False) -> dict[str, Any]:
+def _dialog_page(
+    data: dict[str, Any], requested_folder: str, limit: int,
+    unread_only: bool = False, unmuted_only: bool = False,
+) -> dict[str, Any]:
     folders = list(data.get("folders") or [])
     valid_ids = {str(folder.get("id")) for folder in folders if isinstance(folder, dict)}
     selected = requested_folder if requested_folder in valid_ids else "all"
@@ -571,6 +596,8 @@ def _dialog_page(data: dict[str, Any], requested_folder: str, limit: int, unread
         if not isinstance(dialog, dict):
             continue
         if unread_only and int(dialog.get("unread", 0) or 0) <= 0:
+            continue
+        if unmuted_only and dialog.get("muted") is True:
             continue
         folder_ids = dialog.get("folderIds")
         if isinstance(folder_ids, list) and selected in folder_ids:
@@ -744,9 +771,10 @@ def dialogs(
     limit: Annotated[int, Query(ge=1, le=50)] = 20,
     folder: Annotated[str, Query(max_length=64)] = "all",
     unreadOnly: bool = False,
+    unmutedOnly: bool = False,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    _reject_query_extras(request, {"scope", "limit", "folder", "unreadOnly", "refresh"})
+    _reject_query_extras(request, {"scope", "limit", "folder", "unreadOnly", "unmutedOnly", "refresh"})
     binding = _binding(scope)
     me, _ = _provider_context(binding)
 
@@ -782,7 +810,7 @@ def dialogs(
         _dialog_cache_put(scope, data)
     else:
         data = cached
-    page = _dialog_page(data, folder, limit, unread_only=unreadOnly)
+    page = _dialog_page(data, folder, limit, unread_only=unreadOnly, unmuted_only=unmutedOnly)
     return {**page, "me": me}
 
 
@@ -838,6 +866,7 @@ def topics(
                     "id": int(topic.id),
                     "title": str(topic.title),
                     "topMessage": int(topic.top_message),
+                    "readInboxMaxId": int(topic.read_inbox_max_id or 0),
                     "unread": int(topic.unread_count or 0),
                     "pinned": bool(topic.pinned),
                     "closed": bool(topic.closed),
@@ -851,61 +880,11 @@ def topics(
         data = _run_async(_with_client(_collect))
     except _AuthUnavailable as exc:
         raise HTTPException(status_code=503, detail=f"Telegram backend unavailable: {exc}") from None
+    except HTTPException:
+        raise
     except Exception:
         raise _provider_error() from None
-    _DIALOG_CACHE.pop(scope, None)
     return {**data, "me": me}
-
-
-@router.post("/dialogs/mark-read")
-def mark_read(
-    request: Request,
-    scope: ScopeText,
-    body: _MarkReadBody,
-) -> dict[str, Any]:
-    """Mark one dialog's history as read (channels: mark channel read).
-
-    Read-only guarantee: only advances the read pointer to the dialog's top
-    message; verifies the resulting unread count and invalidates the dialog
-    cache so counters refresh immediately.
-    """
-    _reject_query_extras(request, set())
-    binding = _binding(scope)
-    me, _ = _provider_context(binding)
-
-    async def _mark(client: Any) -> dict[str, Any]:
-        from telethon import utils
-
-        entity, name = await _peer_out(client, body.peer)
-        peer_key = _peer_key(entity)
-        # The dialog's top message is the read ceiling. Match dialogs by the
-        # marked peer id (custom Dialog.id is utils.get_peer_id output), not
-        # the raw entity id — the old d.id == entity.id check missed
-        # supergroups/channels and left max_id=0.
-        dialog = _find_dialog(client, entity)
-        ceiling = _dialog_read_ceiling(dialog) if dialog is not None else 0
-        if ceiling <= 0:
-            # No dialog snapshot (fresh account or history): explicitly mark
-            # the entity itself read.
-            await client.send_read_acknowledge(entity, max_id=0)
-        else:
-            await client.send_read_acknowledge(entity, max_id=ceiling)
-        # Read back the resulting unread count from a fresh dialogs page.
-        fresh = await client.get_dialogs(limit=_DIALOG_SNAPSHOT_LIMIT)
-        after = next((d for d in fresh if _dialog_match(d, entity)), None)
-        unread_after = int(getattr(after, "unread_count", 0) or 0) if after is not None else 0
-        return {"peer": name, "peerKey": peer_key, "unread": unread_after}
-
-    try:
-        outcome = _run_async(_with_client(_mark))
-    except _AuthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=f"Telegram backend unavailable: {exc}") from None
-    except Exception:
-        raise _provider_error() from None
-    if outcome["unread"] != 0:
-        raise _provider_error(mutation_started=True)
-    _DIALOG_CACHE.pop(scope, None)
-    return {"status": "verified", **outcome}
 
 
 @router.get("/messages")
@@ -922,14 +901,24 @@ def messages(
 
     async def _collect(client: Any) -> list[dict[str, Any]]:
         entity, _ = await _peer_out(client, peer)
-        kwargs: dict[str, Any] = {"limit": limit}
-        if topicId:
+        cursor = await _message_read_cursor(client, entity, topicId)
+        general_topic = topicId == 1
+        # ponytail: General scans at most 500 posts to filter sparse forums; paginate if that ceiling proves too small.
+        iterator_limit = min(500, max(100, limit * 10)) if general_topic else limit
+        kwargs: dict[str, Any] = {"limit": iterator_limit}
+        if topicId > 1:
             kwargs["reply_to"] = topicId
+        if cursor > 0:
+            # Telethon excludes min_id itself, so use cursor-1 to include the
+            # last-read post when it is still available.
+            kwargs.update(min_id=cursor - 1, reverse=True)
         me_entity = await client.get_me()
         own_id = int(getattr(me_entity, "id", 0) or 0)
         found: list[dict[str, Any]] = []
         preview_count = 0
         async for message in client.iter_messages(entity, **kwargs):
+            if general_topic and not _message_is_general_topic(message):
+                continue
             item = _public_message(message, own_id or 0)
             if preview_count < _MAX_MEDIA_PREVIEW_MESSAGES and _message_has_image_media(message):
                 try:
@@ -941,7 +930,12 @@ def messages(
                     item["mediaPreview"] = preview
                     preview_count += 1
             found.append(item)
-        found.reverse()
+            if len(found) >= limit:
+                break
+        # With no cursor, Telethon's default newest-first window is reversed
+        # locally. Cursor mode requested reverse=True and is already ascending.
+        if cursor <= 0:
+            found.reverse()
         return found
 
     try:
@@ -997,21 +991,29 @@ def prepare_action(request: Request, body: PrepareRequest) -> dict[str, Any]:
             }
             return preview, snapshot
         if body.action == "mark-read":
+            if body.topicId == 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The General forum topic cannot be marked read separately; return to the forum and choose the chat-wide action.",
+                )
             unread_now = await _unread_count_for(client, entity)
-            target = None
-            if body.maxId:
-                target = await client.get_messages(entity, ids=body.maxId)
+            target = await client.get_messages(entity, ids=body.maxId)
+            if target is None:
+                raise HTTPException(status_code=409, detail="Read target no longer exists; review the action again.")
+            if body.topicId:
+                await _validate_topic_target(client, entity, body.topicId, target)
+            snapshot = _public_message(target, await _me_id(client))
             preview = {
                 "action": "mark-read",
                 "me": me,
                 "peer": name,
                 "peerKey": _peer_key(entity),
                 "maxId": body.maxId,
+                "topicId": body.topicId,
                 "unreadNow": unread_now,
+                "targetMessage": snapshot,
             }
-            if target is not None:
-                preview["targetMessage"] = _public_message(target, await _me_id(client))
-            return preview, target
+            return preview, snapshot
         # delete
         target = await client.get_messages(entity, ids=body.messageId)
         if target is None:
@@ -1058,17 +1060,40 @@ def _dialog_match(dialog: Any, entity: Any) -> bool:
     )
 
 
-def _dialog_read_ceiling(dialog: Any) -> int:
-    """Exact read ceiling for a dialog: its top message id."""
-    top = getattr(getattr(dialog, "message", None), "id", 0)
-    return int(top or 0)
-
-
 def _dialog_read_cursor(dialog: Any) -> int:
     """Inbox read cursor (raw TL Dialog.read_inbox_max_id) for readback."""
     wrapped = getattr(dialog, "dialog", dialog)
     cursor = getattr(wrapped, "read_inbox_max_id", None)
     return int(cursor or 0)
+
+
+async def _forum_topic_by_id(client: Any, entity: Any, topic_id: int) -> Any:
+    from telethon import functions
+
+    response = await client(functions.messages.GetForumTopicsByIDRequest(
+        peer=entity, topics=[topic_id],
+    ))
+    return next(
+        (item for item in (getattr(response, "topics", None) or [])
+         if int(getattr(item, "id", 0) or 0) == topic_id),
+        None,
+    )
+
+
+async def _validate_topic_target(client: Any, entity: Any, topic_id: int, target: Any) -> None:
+    if not bool(getattr(entity, "forum", False)) or await _forum_topic_by_id(client, entity, topic_id) is None:
+        raise HTTPException(status_code=409, detail="The requested forum topic is unavailable.")
+    if not _message_belongs_to_forum_topic(target, topic_id):
+        raise HTTPException(status_code=409, detail="The selected message is not in the requested forum topic.")
+
+
+async def _message_read_cursor(client: Any, entity: Any, topic_id: int = 0) -> int:
+    """Read the exact chat/topic cursor; return 0 when no cursor is available."""
+    if topic_id:
+        topic = await _forum_topic_by_id(client, entity, topic_id)
+        return int(getattr(topic, "read_inbox_max_id", 0) or 0)
+    dialog = await _find_dialog(client, entity)
+    return _dialog_read_cursor(dialog) if dialog is not None else 0
 
 
 async def _unread_count_for(client: Any, entity: Any) -> int:
@@ -1112,7 +1137,29 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
             )
             return {"sentId": int(sent.id), "peer": name}
         if action == "mark-read":
-            await client.send_read_acknowledge(entity, max_id=payload["maxId"])
+            target = await client.get_messages(entity, ids=payload["maxId"])
+            if target is None:
+                raise HTTPException(status_code=409, detail="Read target no longer exists; review the action again.")
+            topic_id = int(payload.get("topicId") or 0)
+            if topic_id == 1:
+                raise HTTPException(status_code=409, detail="General forum topic read is not available as a scoped action.")
+            if topic_id:
+                await _validate_topic_target(client, entity, topic_id, target)
+            current = _public_message(target, await _me_id(client))
+            if (
+                ticket.message_snapshot is None
+                or int(ticket.message_snapshot.get("id", 0) or 0) != int(payload["maxId"])
+                or _message_snapshot(current) != ticket.message_snapshot
+            ):
+                raise HTTPException(status_code=409, detail="Read target changed; review the action again.")
+            if topic_id:
+                from telethon import functions
+
+                await client(functions.messages.ReadDiscussionRequest(
+                    peer=entity, msg_id=topic_id, read_max_id=payload["maxId"],
+                ))
+            else:
+                await client.send_read_acknowledge(entity, max_id=payload["maxId"])
             return {"peer": name, "maxId": payload["maxId"]}
         target = await client.get_messages(entity, ids=payload["messageId"])
         if target is None:
@@ -1145,22 +1192,26 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
                 "text": (message.message or "")[:200],
             }
         if action == "mark-read":
-            unread_after = await _unread_count_for(client, entity)
-            result = {"status": "verified", "peer": name, "unread": unread_after}
-            max_id = int(payload.get("maxId") or 0)
-            if max_id > 0:
+            topic_id = int(payload.get("topicId") or 0)
+            max_id = int(payload["maxId"])
+            if topic_id:
+                topic = await _forum_topic_by_id(client, entity, topic_id)
+                if topic is None:
+                    raise ValueError("forum topic readback is unavailable")
+                unread_after = int(getattr(topic, "unread_count", 0) or 0)
+                cursor = int(getattr(topic, "read_inbox_max_id", 0) or 0)
+            else:
+                unread_after = await _unread_count_for(client, entity)
                 fresh = await client.get_dialogs(limit=_DIALOG_SNAPSHOT_LIMIT)
                 after_dialog = next((d for d in fresh if _dialog_match(d, entity)), None)
                 cursor = _dialog_read_cursor(after_dialog) if after_dialog is not None else 0
-                # A bounded read must advance the inbox cursor through the
-                # requested message; newer messages may remain unread and
-                # unread_after > 0 is expected there.
-                if cursor < max_id:
-                    raise ValueError("read cursor did not advance through the requested message")
-                result["readCursor"] = cursor
-            else:
-                if unread_after != 0:
-                    raise ValueError("read state mismatch")
+            # A bounded read must advance the exact chat/topic cursor through
+            # the requested post; newer posts may remain unread.
+            if cursor < max_id:
+                raise ValueError("read cursor did not advance through the requested message")
+            result = {"status": "verified", "peer": name, "unread": unread_after, "readCursor": cursor}
+            if topic_id:
+                result["topicId"] = topic_id
             return result
         # delete
         message = await client.get_messages(entity, ids=payload["messageId"])
@@ -1172,4 +1223,6 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
         result = _run_async(_with_client(_verify))
     except Exception:
         raise _provider_error(mutation_started=True) from None
+    if action == "mark-read":
+        _DIALOG_CACHE.pop(body.scope, None)
     return result
