@@ -503,12 +503,14 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     if (path.startsWith('/dialogs?')) {
       params.folder = folder
       params.unreadOnly = String(unreadOnly)
+      if (new URLSearchParams(path.split('?')[1] || '').get('refresh') === '1') params.refresh = '1'
     }
     return ctx.rest(path + (path.includes('?') ? '&' : '?') + new URLSearchParams(params), { timeoutMs: 60000 })
   }
+  const [forceDialogsRefresh, setForceDialogsRefresh] = useState(0)
   const dialogsQuery = useQuery({
-    queryKey: [...queryPrefix, scope, 'dialogs', folder, unreadOnly],
-    queryFn: () => read('/dialogs?limit=40'),
+    queryKey: [...queryPrefix, scope, 'dialogs', folder, unreadOnly, forceDialogsRefresh],
+    queryFn: () => read('/dialogs?limit=40&refresh=' + (forceDialogsRefresh > 0 ? '1' : '0')),
     refetchInterval: settings.autoRefresh ? 60000 : false,
     enabled: !statusUnavailable,
   })
@@ -590,13 +592,31 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
   const folderTabs = selectedTab === folder ? folders : [{ id: 'all', title: 'All' }, ...folders.filter(item => item.id !== 'all')]
   const visibleDialogs = filterDialogs(dialogsList, selectedTab, settings.unmutedOnly)
 
-  const tabBar = jsx('div', { role: 'tablist', 'aria-label': 'Telegram folders', style: { ...row, gap: '0.25rem', overflowX: 'auto', flexWrap: 'nowrap' }, children:
+  const tabBar = jsx('div', { role: 'tablist', 'aria-label': 'Telegram folders', 'aria-orientation': 'horizontal', tabIndex: 0,
+    onKeyDown: event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+      const tabs = Array.from(event.currentTarget.querySelectorAll('[role="tab"]'))
+      if (!tabs.length) return
+      const selectedIndex = tabs.findIndex(tab => tab.getAttribute('aria-selected') === 'true')
+      const focusedIndex = tabs.indexOf(event.target)
+      const currentIndex = focusedIndex >= 0 ? focusedIndex : Math.max(0, selectedIndex)
+      const nextIndex = event.key === 'Home' ? 0
+        : event.key === 'End' ? tabs.length - 1
+        : (currentIndex + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length
+      event.preventDefault()
+      tabs[nextIndex].focus()
+      tabs[nextIndex].click()
+    },
+    style: {
+    ...row, gap: '0.25rem', minWidth: 0, width: '100%', maxWidth: '100%', boxSizing: 'border-box',
+    overflowX: 'auto', overflowY: 'hidden', flexWrap: 'nowrap', scrollbarWidth: 'thin', overscrollBehaviorX: 'contain',
+  }, children:
     folderTabs.map(folder => jsx('button', {
       type: 'button', role: 'tab', 'aria-selected': selectedTab === folder.id,
       onClick: () => setFolder(folder.id),
       style: {
         border: 'none', cursor: 'pointer', font: 'inherit', padding: '0.25rem 0.7rem',
-        borderRadius: '999px', whiteSpace: 'nowrap',
+        borderRadius: '999px', whiteSpace: 'nowrap', flex: '0 0 auto',
         background: selectedTab === folder.id ? 'var(--dt-primary-solid)' : 'transparent',
         color: selectedTab === folder.id ? 'var(--dt-primary-solid-foreground)' : 'var(--ui-text-secondary)',
         fontWeight: selectedTab === folder.id ? 700 : 500,
@@ -605,11 +625,18 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     }, folder.id))
   })
 
-  return jsxs('div', { style: { ...stack, height: '100%' }, children: [
-    jsxs('div', { style: { ...row, justifyContent: 'space-between' }, children: [
-      jsxs('div', { style: row, children: [
+  return jsxs('div', { style: { ...stack, height: '100%', width: '100%', minWidth: 0 }, children: [
+    jsxs('div', { style: { ...stack, width: '100%', minWidth: 0, gap: '0.35rem' }, children: [
+      jsxs('div', { style: { ...row, justifyContent: 'space-between', flexWrap: 'wrap', minWidth: 0 }, children: [
         jsx('strong', { children: `Telegram — ${me}` }),
-        tabBar,
+        jsxs('div', { style: { ...row, flexWrap: 'wrap' }, children: [
+          action(settings.autoRefresh ? 'Turn off auto-refresh' : 'Auto-refresh (60s)', () =>
+            setSettings(current => ({ ...current, autoRefresh: !current.autoRefresh })), false),
+          action('New message', () => beginCompose(''), waiting)
+        ] })
+      ] }),
+      tabBar,
+      jsxs('div', { style: { ...row, flexWrap: 'wrap', minWidth: 0 }, children: [
         jsx('button', {
           type: 'button', role: 'switch', 'aria-checked': unreadOnly,
           onClick: () => setUnreadOnly(value => !value),
@@ -632,11 +659,6 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
           },
           children: settings.unmutedOnly ? '🔔 Unmuted only ✓' : '🔔 Unmuted only',
         }),
-      ] }),
-      jsxs('div', { style: row, children: [
-        action(settings.autoRefresh ? 'Turn off auto-refresh' : 'Auto-refresh (60s)', () =>
-          setSettings(current => ({ ...current, autoRefresh: !current.autoRefresh })), false),
-        action('New message', () => beginCompose(''), waiting)
       ] })
     ] }),
     feedback && jsx('div', { children: note(feedback.text, !!feedback.error) }),

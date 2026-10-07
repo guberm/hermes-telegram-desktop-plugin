@@ -10,6 +10,7 @@ profile's Hermes home; this module never copies or persists credentials.
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import json
 import re
@@ -96,6 +97,9 @@ _TICKET_TTL_SECONDS = 300.0
 _MAX_TICKETS = 256
 _MAX_SCOPES = 128
 _MAX_PROVIDER_TEXT = 16 * 1024
+_MAX_MEDIA_PREVIEW_MESSAGES = 8
+_MAX_MEDIA_PREVIEW_BYTES = 64 * 1024
+_MAX_MEDIA_PREVIEW_DATA_URI_LENGTH = 88_000
 _TOPIC_ROOT_RE = re.compile(r"^https?://t\.me/c/(\d+)/(?:\d+/)?(\d+)")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,256}$")
 _BACKEND_INSTANCE = secrets.token_urlsafe(24)
@@ -337,6 +341,33 @@ def _run_async(coroutine: Any) -> Any:
     return _telegram_manager().run(coroutine)
 
 
+def _media_preview_data_uri(data: Any) -> str | None:
+    """Return a bounded data URI only for common raster image formats."""
+    if not isinstance(data, bytes) or not data or len(data) > _MAX_MEDIA_PREVIEW_BYTES:
+        return None
+    if data.startswith(b"\xff\xd8\xff"):
+        media_type = "image/jpeg"
+    elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+        media_type = "image/png"
+    elif data.startswith((b"GIF87a", b"GIF89a")):
+        media_type = "image/gif"
+    elif len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        media_type = "image/webp"
+    else:
+        return None
+    encoded = base64.b64encode(data).decode("ascii")
+    preview = f"data:{media_type};base64,{encoded}"
+    return preview if len(preview) <= _MAX_MEDIA_PREVIEW_DATA_URI_LENGTH else None
+
+
+def _message_has_image_media(message: Any) -> bool:
+    if getattr(message, "photo", None) is not None:
+        return True
+    document = getattr(message, "document", None)
+    mime_type = getattr(document, "mime_type", "") if document is not None else ""
+    return mime_type in {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
 def _public_message(message: Any, me_id: int) -> dict[str, Any]:
     sender = message.sender
     sender_name = ""
@@ -346,6 +377,14 @@ def _public_message(message: Any, me_id: int) -> dict[str, Any]:
         title = getattr(sender, "title", None) or ""
         sender_name = title or f"{first} {last}".strip() or getattr(sender, "username", "") or ""
     text = message.message or ""
+    display_text = text[:4096]
+    try:
+        from telethon.extensions.html import unparse
+
+        formatted_text = unparse(display_text, getattr(message, "entities", None) or [])
+    except Exception:
+        formatted_text = escape(display_text)
+    html_preview = sanitize_message_html(formatted_text)
     media_kind = ""
     if message.media:
         media_kind = message.media.__class__.__name__
@@ -355,8 +394,8 @@ def _public_message(message: Any, me_id: int) -> dict[str, Any]:
         "date": message.date.isoformat() if message.date else "",
         "out": bool(message.out),
         "sender": sender_name,
-        "text": text[:4096],
-        "htmlPreview": sanitize_message_html(text[:4096]),
+        "text": display_text,
+        "htmlPreview": html_preview,
         "media": media_kind,
         "replyTo": int(message.reply_to.reply_to_msg_id) if message.reply_to else None,
         "mine": bool(message.out) or (message.sender_id == me_id if message.sender_id is not None else False),
@@ -406,7 +445,8 @@ def _peer_identity(entity: Any) -> int | None:
 
 
 def _dialog_is_muted(dialog: Any, now: float | None = None) -> bool:
-    settings = getattr(dialog, "notify_settings", None)
+    wrapped_dialog = getattr(dialog, "dialog", dialog)
+    settings = getattr(wrapped_dialog, "notify_settings", None)
     mute_until = getattr(settings, "mute_until", None) if settings is not None else None
     if not mute_until:
         return False
@@ -515,6 +555,7 @@ def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any]) -> tu
             "folderIds": folder_ids,
             "folderPins": folder_pins,
             "kind": entity.__class__.__name__ if entity is not None else "",
+            "isForum": bool(getattr(entity, "forum", False)),
             "lastMessageDate": dialog.date.isoformat() if getattr(dialog, "date", None) else "",
         })
     return folders, rows
@@ -702,14 +743,15 @@ def dialogs(
     limit: Annotated[int, Query(ge=1, le=50)] = 20,
     folder: Annotated[str, Query(max_length=64)] = "all",
     unreadOnly: bool = False,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    _reject_query_extras(request, {"scope", "limit", "folder", "unreadOnly"})
+    _reject_query_extras(request, {"scope", "limit", "folder", "unreadOnly", "refresh"})
     binding = _binding(scope)
     me, _ = _provider_context(binding)
 
     # Folder/tab switches reuse the snapshot for a few seconds: switching tabs
-    # must be instant like the native client; the Refresh button bypasses it.
-    cached = _dialog_cache_get(scope)
+    # must be instant like the native client; refresh=1 bypasses the cache.
+    cached = None if refresh else _dialog_cache_get(scope)
     if cached is None:
         async def _collect(client: Any) -> dict[str, Any]:
             from telethon import functions
@@ -764,6 +806,54 @@ def _dialog_cache_put(scope: str, data: dict[str, Any]) -> None:
         _DIALOG_CACHE[scope] = {"fetchedAt": data.get("fetchedAt", time.time()), "data": data}
         while len(_DIALOG_CACHE) > 8:
             _DIALOG_CACHE.popitem(last=False)
+
+
+@router.get("/topics")
+def topics(
+    request: Request,
+    scope: ScopeText,
+    peer: Annotated[str, Query(max_length=256)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> dict[str, Any]:
+    """List forum topics for a forum-enabled group/supergroup."""
+    _reject_query_extras(request, {"scope", "peer", "limit"})
+    binding = _binding(scope)
+    me, _ = _provider_context(binding)
+
+    async def _collect(client: Any) -> dict[str, Any]:
+        from telethon import functions
+        from telethon.tl import types as tl_types
+
+        entity, name = await _peer_out(client, peer)
+        if not bool(getattr(entity, "forum", False)):
+            return {"peer": name, "isForum": False, "topics": []}
+        response = await client(functions.messages.GetForumTopicsRequest(
+            peer=entity, offset_date=None, offset_id=0, offset_topic=0, limit=limit,
+        ))
+        topics: list[dict[str, Any]] = []
+        for topic in getattr(response, "topics", None) or []:
+            if isinstance(topic, tl_types.ForumTopic):
+                topics.append({
+                    "id": int(topic.id),
+                    "title": str(topic.title),
+                    "topMessage": int(topic.top_message),
+                    "unread": int(topic.unread_count or 0),
+                    "pinned": bool(topic.pinned),
+                    "closed": bool(topic.closed),
+                })
+            elif isinstance(topic, tl_types.ForumTopicDeleted):
+                continue
+        topics.sort(key=lambda item: (not item["pinned"], -item["id"]))
+        return {"peer": name, "isForum": True, "topics": topics[:limit]}
+
+    try:
+        data = _run_async(_with_client(_collect))
+    except _AuthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=f"Telegram backend unavailable: {exc}") from None
+    except Exception:
+        raise _provider_error() from None
+    _DIALOG_CACHE.pop(scope, None)
+    return {**data, "me": me}
 
 
 @router.post("/dialogs/mark-read")
@@ -836,8 +926,20 @@ def messages(
         me_entity = await client.get_me()
         own_id = int(getattr(me_entity, "id", 0) or 0)
         found: list[dict[str, Any]] = []
+        preview_count = 0
         async for message in client.iter_messages(entity, **kwargs):
-            found.append(_public_message(message, own_id or 0))
+            item = _public_message(message, own_id or 0)
+            if preview_count < _MAX_MEDIA_PREVIEW_MESSAGES and _message_has_image_media(message):
+                try:
+                    raw_preview = await client.download_media(message, file=bytes, thumb=0)
+                except Exception:
+                    raw_preview = None
+                preview = _media_preview_data_uri(raw_preview)
+                if preview:
+                    item["mediaPreview"] = preview
+                    preview_count += 1
+            found.append(item)
+        found.reverse()
         return found
 
     try:

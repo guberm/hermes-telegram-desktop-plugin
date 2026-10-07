@@ -132,6 +132,34 @@ test('unread badge uses the verified Desktop contrast tokens and readable counts
   assert.equal(badge(100, false).props.children, '99+')
 })
 
+test('folder tabs remain horizontally scrollable in a constrained narrow header', () => {
+  const start = source.indexOf("const tabBar = jsx('div', { role: 'tablist'")
+  const end = source.indexOf("feedback &&", start)
+  assert.ok(start > 0 && end > start, 'folder tab bar is rendered before the dialog content')
+  const header = source.slice(start, end)
+  assert.match(header, /minWidth: 0/)
+  assert.match(header, /overflowX: 'auto'/)
+  assert.match(header, /scrollbarWidth: 'thin'/)
+  assert.match(header, /'aria-label': 'Telegram folders'/)
+  assert.match(header, /'aria-orientation': 'horizontal'/)
+  assert.match(header, /tabIndex: 0/)
+  assert.match(header, /onKeyDown: event =>/)
+  assert.match(header, /flex: '0 0 auto'/)
+  assert.match(header, /\.\.\.stack, width: '100%', minWidth: 0/)
+})
+
+test('safe Telegram image previews render as bounded lazy images', () => {
+  const render = loadFunction('renderMediaPreview', 'filterDialogs', 'const jsx = (type, props) => ({ type, props })')
+  const src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB'
+  const image = render({ id: 7, mediaPreview: src })
+  assert.equal(image.type, 'img')
+  assert.equal(image.props.src, src)
+  assert.equal(image.props.loading, 'lazy')
+  assert.match(image.props.alt, /7/)
+  assert.equal(render({ mediaPreview: 'data:image/svg+xml;base64,PHN2Zz4=' }), null)
+  assert.equal(render({ mediaPreview: `data:image/png;base64,${'A'.repeat(88000)}` }), null)
+})
+
 test('dialog tabs filter by backend-returned stable folder IDs', () => {
   const filter = loadFunction('filterDialogs', 'Confirmation')
   const rows = [

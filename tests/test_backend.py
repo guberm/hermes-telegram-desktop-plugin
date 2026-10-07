@@ -232,6 +232,15 @@ class DialogFolderTests(unittest.TestCase):
         self.assertIn("9", by_key["@old"])
         self.assertEqual(by_key["@old"], {"archive", "9"})
 
+    def test_muted_state_reads_telethon_dialog_wrapper(self):
+        wrapped = SimpleNamespace(
+            entity=SimpleNamespace(id=101, username="muted", first_name="Muted", title=None),
+            unread_count=1, folder_id=0,
+            dialog=SimpleNamespace(notify_settings=SimpleNamespace(mute_until=4_000_000_000)),
+        )
+        _, rows = MODULE._apply_dialog_filters([wrapped], [])
+        self.assertTrue(rows[0]["muted"])
+
     def test_expired_mute_timestamp_is_not_muted(self):
         past = SimpleNamespace(notify_settings=SimpleNamespace(mute_until=100))
         future = SimpleNamespace(notify_settings=SimpleNamespace(mute_until=500))
@@ -254,6 +263,123 @@ class DialogFolderTests(unittest.TestCase):
 
 
 class PublicMessageTests(unittest.TestCase):
+    def test_telegram_entities_are_rendered_in_sanitized_preview(self):
+        from telethon.tl.types import MessageEntityBold
+
+        msg = make_message()
+        msg.message = "bold"
+        msg.entities = [MessageEntityBold(offset=0, length=4)]
+        self.assertEqual(public(msg)["htmlPreview"], "<b>bold</b>")
+
+    def test_recent_messages_are_returned_oldest_to_newest(self):
+        class Client:
+            async def get_entity(self, peer):
+                return SimpleNamespace(id=-100123, title="Test Group")
+
+            async def get_me(self):
+                return SimpleNamespace(id=1)
+
+            async def iter_messages(self, entity, **kwargs):
+                for mid in (3, 2, 1):
+                    yield make_message(mid)
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.messages(
+                SimpleNamespace(query_params={}), scope="test-scope", peer="@testgroup", limit=3, topicId=0,
+            )
+        self.assertEqual([item["id"] for item in result["messages"]], [1, 2, 3])
+
+    def test_messages_include_bounded_raster_photo_previews(self):
+        from base64 import b64decode
+
+        image_bytes = b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jE0cAAAAASUVORK5CYII="
+        )
+        message = make_message(101)
+        message.media = SimpleNamespace()
+        message.photo = SimpleNamespace()
+        message.document = None
+
+        class Client:
+            async def get_entity(self, peer):
+                return SimpleNamespace(id=-100123, title="Test Group")
+
+            async def get_me(self):
+                return SimpleNamespace(id=1)
+
+            async def iter_messages(self, entity, **kwargs):
+                yield message
+
+            async def download_media(self, target, file, *, thumb):
+                self_thumb = thumb
+                assert target is message and file is bytes and self_thumb == 0
+                return image_bytes
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.messages(
+                SimpleNamespace(query_params={}), scope="test-scope", peer="@testgroup", limit=1, topicId=0,
+            )
+
+        preview = result["messages"][0]["mediaPreview"]
+        self.assertTrue(preview.startswith("data:image/png;base64,"))
+        self.assertLessEqual(len(preview), MODULE._MAX_MEDIA_PREVIEW_DATA_URI_LENGTH)
+
+    def test_unrecognized_image_preview_is_not_returned(self):
+        message = make_message(101)
+        message.media = SimpleNamespace()
+        message.photo = SimpleNamespace()
+        message.document = None
+
+        class Client:
+            async def get_entity(self, peer):
+                return SimpleNamespace(id=-100123, title="Test Group")
+
+            async def get_me(self):
+                return SimpleNamespace(id=1)
+
+            async def iter_messages(self, entity, **kwargs):
+                yield message
+
+            async def download_media(self, target, file, *, thumb):
+                return b"<svg onload=alert(1)>"
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.messages(
+                SimpleNamespace(query_params={}), scope="test-scope", peer="@testgroup", limit=1, topicId=0,
+            )
+
+        self.assertNotIn("mediaPreview", result["messages"][0])
+
     def test_public_message_shape(self):
         item = public(make_message())
         self.assertEqual(item["sender"], "Ada Lovelace")
