@@ -209,6 +209,13 @@ export function AuthPanel({ ctx, onAuthorized }) {
         : await ctx.rest('/auth/submit-code', { method: 'POST', body: { code }, timeoutMs: 40000 })
       applyAuthState(result)
       setCode(''); setEmailCode('')
+      // The response itself is authoritative for the next stage; re-read the
+      // backend state once so a password hint stage never gets lost if the
+      // submit response and state diverge (e.g. server-side stage persisted
+      // before the response round-trip).
+      if (result?.stage === 'sent-code' || result?.stage === 'email-code') {
+        applyAuthState(await ctx.rest('/auth/state', { timeoutMs: 20000 }))
+      }
     } catch (e) { setError(errorText(e)) } finally { setBusy(false) }
   }
   async function setupEmail() {
@@ -297,6 +304,8 @@ export function AuthPanel({ ctx, onAuthorized }) {
           action('Verify email', () => { void verifySetupEmail() }, busy || !emailCode.trim()),
         ] }),
       ] }),
+      // 2FA may be reached directly (e.g. after a page reload while the backend
+      // is already in the password stage) — render for any mode, not just phone.
       stage === 'password' && jsxs('div', { style: stack, children: [
         note(`Two-factor authentication is enabled.${hint ? ` Password hint: ${hint}` : ''}${emailPattern ? ` Recovery email: ${emailPattern}` : ''}`),
         jsx(Field, { label: '2FA password', value: password, onChange: setPassword, disabled: busy, type: 'password', autoComplete: 'current-password' }),
