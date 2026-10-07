@@ -10,6 +10,7 @@ import importlib.util
 import asyncio
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -473,6 +474,37 @@ class CommitFlowTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as raised:
                 MODULE.commit_action(self.request, MODULE.CommitRequest(scope=self.scope, confirmationToken="missing-token-12345678", confirmed=True))
         self.assertEqual(raised.exception.status_code, 409)
+
+
+class ForcedRefreshRouteTests(unittest.TestCase):
+    def test_refresh_true_bypasses_cached_snapshot(self):
+        MODULE._DIALOG_CACHE.clear()
+        scope = "a" * 32
+        stale = {"dialogs": [], "folders": [], "fetchedAt": time.time() - 5}
+        MODULE._DIALOG_CACHE[scope] = stale
+
+        payload = {"dialogs": [], "folders": [], "fetchedAt": time.time()}
+        collected = {"called": False}
+
+        def fake_run(_coro):
+            return payload
+
+        def fake_with_client(_handler):
+            collected["called"] = True
+            return payload
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", new=fake_with_client),
+            patch.object(MODULE, "_run_async", new=fake_run),
+        ):
+            # refresh=True must not consult the cache and must reach the client.
+            MODULE.dialogs(SimpleNamespace(query_params={}), scope=scope, limit=20, folder="all", unreadOnly=False, refresh=True)
+            self.assertTrue(collected["called"], "refresh=True must invoke the collector")
+
+            # A normal (refresh=False) request within TTL must hit the cache.
+            self.assertIsNotNone(MODULE._dialog_cache_get(scope))
 
 
 def _fake_async(coro, result_fn):

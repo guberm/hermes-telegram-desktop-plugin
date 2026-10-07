@@ -556,6 +556,7 @@ def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any]) -> tu
             "folderPins": folder_pins,
             "kind": entity.__class__.__name__ if entity is not None else "",
             "isForum": bool(getattr(entity, "forum", False)),
+            "topMessageId": int(getattr(getattr(dialog, "message", None), "id", 0) or 0),
             "lastMessageDate": dialog.date.isoformat() if getattr(dialog, "date", None) else "",
         })
     return folders, rows
@@ -873,24 +874,25 @@ def mark_read(
     me, _ = _provider_context(binding)
 
     async def _mark(client: Any) -> dict[str, Any]:
-        from telethon import functions, utils
+        from telethon import utils
 
         entity, name = await _peer_out(client, body.peer)
         peer_key = _peer_key(entity)
-        # The dialog's top message is the read ceiling; unread counters drop to
-        # zero exactly like pressing the chat in the native client.
-        dialog = await client.get_dialogs(limit=_DIALOG_SNAPSHOT_LIMIT)
-        target = next((d for d in dialog if d.id == entity.id), None)
-        max_id = 0
-        if target is not None and getattr(target, "message", None) is not None:
-            max_id = int(target.message.id)
-        if getattr(entity, "broadcast", False):
-            await client(functions.channels.ReadHistoryRequest(utils.get_input_channel(entity), max_id=max_id))
+        # The dialog's top message is the read ceiling. Match dialogs by the
+        # marked peer id (custom Dialog.id is utils.get_peer_id output), not
+        # the raw entity id — the old d.id == entity.id check missed
+        # supergroups/channels and left max_id=0.
+        dialog = _find_dialog(client, entity)
+        ceiling = _dialog_read_ceiling(dialog) if dialog is not None else 0
+        if ceiling <= 0:
+            # No dialog snapshot (fresh account or history): explicitly mark
+            # the entity itself read.
+            await client.send_read_acknowledge(entity, max_id=0)
         else:
-            await client(functions.messages.ReadHistoryRequest(utils.get_input_peer(entity), max_id=max_id))
+            await client.send_read_acknowledge(entity, max_id=ceiling)
         # Read back the resulting unread count from a fresh dialogs page.
         fresh = await client.get_dialogs(limit=_DIALOG_SNAPSHOT_LIMIT)
-        after = next((d for d in fresh if d.id == entity.id), None)
+        after = next((d for d in fresh if _dialog_match(d, entity)), None)
         unread_after = int(getattr(after, "unread_count", 0) or 0) if after is not None else 0
         return {"peer": name, "peerKey": peer_key, "unread": unread_after}
 
@@ -996,6 +998,9 @@ def prepare_action(request: Request, body: PrepareRequest) -> dict[str, Any]:
             return preview, snapshot
         if body.action == "mark-read":
             unread_now = await _unread_count_for(client, entity)
+            target = None
+            if body.maxId:
+                target = await client.get_messages(entity, ids=body.maxId)
             preview = {
                 "action": "mark-read",
                 "me": me,
@@ -1004,7 +1009,9 @@ def prepare_action(request: Request, body: PrepareRequest) -> dict[str, Any]:
                 "maxId": body.maxId,
                 "unreadNow": unread_now,
             }
-            return preview, None
+            if target is not None:
+                preview["targetMessage"] = _public_message(target, await _me_id(client))
+            return preview, target
         # delete
         target = await client.get_messages(entity, ids=body.messageId)
         if target is None:
@@ -1033,11 +1040,50 @@ def prepare_action(request: Request, body: PrepareRequest) -> dict[str, Any]:
     return {"scope": body.scope, "confirmationToken": token, "expiresAt": expires, "preview": preview}
 
 
+def _dialog_match(dialog: Any, entity: Any) -> bool:
+    """Match a custom Dialog to a resolved entity.
+
+    Telethon's custom Dialog.id is the *marked* peer id
+    (``utils.get_peer_id``: users +1e13, groups +2e13, channels -100 prefix),
+    which differs from the raw entity id for most supergroups/channels.
+    """
+    if dialog is None or entity is None:
+        return False
+    if getattr(dialog, "id", None) == getattr(entity, "id", None):
+        return True
+    dialog_entity = getattr(dialog, "entity", None)
+    return (
+        _peer_identity(dialog_entity) == _peer_identity(entity)
+        or _peer_identity(getattr(dialog, "dialog", dialog_entity)) == _peer_identity(entity)
+    )
+
+
+def _dialog_read_ceiling(dialog: Any) -> int:
+    """Exact read ceiling for a dialog: its top message id."""
+    top = getattr(getattr(dialog, "message", None), "id", 0)
+    return int(top or 0)
+
+
+def _dialog_read_cursor(dialog: Any) -> int:
+    """Inbox read cursor (raw TL Dialog.read_inbox_max_id) for readback."""
+    wrapped = getattr(dialog, "dialog", dialog)
+    cursor = getattr(wrapped, "read_inbox_max_id", None)
+    return int(cursor or 0)
+
+
 async def _unread_count_for(client: Any, entity: Any) -> int:
     for dialog in await client.get_dialogs(limit=200):
-        if dialog.id == entity.id:
+        if _dialog_match(dialog, entity):
             return int(getattr(dialog, "unread_count", 0) or 0)
     return 0
+
+
+async def _find_dialog(client: Any, entity: Any) -> Any:
+    """Locate the custom Dialog for entity, matching by marked peer id."""
+    for dialog in await client.get_dialogs(limit=200):
+        if _dialog_match(dialog, entity):
+            return dialog
+    return None
 
 
 @router.post("/actions/commit")
@@ -1068,7 +1114,6 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
         if action == "mark-read":
             await client.send_read_acknowledge(entity, max_id=payload["maxId"])
             return {"peer": name, "maxId": payload["maxId"]}
-        # delete
         target = await client.get_messages(entity, ids=payload["messageId"])
         if target is None:
             raise HTTPException(status_code=409, detail="Message already deleted; nothing to do.")
@@ -1101,9 +1146,22 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
             }
         if action == "mark-read":
             unread_after = await _unread_count_for(client, entity)
-            if unread_after != 0:
-                raise ValueError("read state mismatch")
-            return {"status": "verified", "peer": name, "unread": unread_after}
+            result = {"status": "verified", "peer": name, "unread": unread_after}
+            max_id = int(payload.get("maxId") or 0)
+            if max_id > 0:
+                fresh = await client.get_dialogs(limit=_DIALOG_SNAPSHOT_LIMIT)
+                after_dialog = next((d for d in fresh if _dialog_match(d, entity)), None)
+                cursor = _dialog_read_cursor(after_dialog) if after_dialog is not None else 0
+                # A bounded read must advance the inbox cursor through the
+                # requested message; newer messages may remain unread and
+                # unread_after > 0 is expected there.
+                if cursor < max_id:
+                    raise ValueError("read cursor did not advance through the requested message")
+                result["readCursor"] = cursor
+            else:
+                if unread_after != 0:
+                    raise ValueError("read state mismatch")
+            return result
         # delete
         message = await client.get_messages(entity, ids=payload["messageId"])
         if message is not None:

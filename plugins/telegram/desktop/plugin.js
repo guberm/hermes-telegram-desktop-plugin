@@ -398,6 +398,20 @@ export function contextText(me, message) {
 
 const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: 'all' })
 const settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`
+
+export function renderMediaPreview(message) {
+  // Bounded, lazy, data-URI-only image: the backend already limits previews
+  // to raster data URIs ≤ 88k chars; anything else stays text.
+  const src = message?.mediaPreview
+  if (typeof src !== 'string' || !/^data:image\/(png|jpe?g|gif|webp);base64,/.test(src) || src.length > 88_000) return null
+  return jsx('img', {
+    src,
+    alt: `Media from message ${message.id}`,
+    loading: 'lazy',
+    style: { maxWidth: '14rem', maxHeight: '14rem', objectFit: 'contain', borderRadius: '0.4rem', border: '1px solid var(--ui-stroke-secondary)' },
+  })
+}
+
 export function loadSettings(storage, key) {
   try {
     const raw = storage.get(key, null)
@@ -713,6 +727,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             message.htmlPreview
               ? jsx(SafeHtml, { markup: message.htmlPreview })
               : jsx('div', { style: text, children: message.text || '(media or empty message)' }),
+            renderMediaPreview(message),
             jsxs('div', { style: row, children: [
               action('Reply', () => setCompose({ peer: dialogKey, messageId: message.id, message: '' }), waiting),
               action('Delete', () => prepareAndConfirm({ action: 'delete', peer: dialogKey, messageId: message.id }),
