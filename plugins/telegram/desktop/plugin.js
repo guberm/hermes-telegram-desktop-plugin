@@ -112,6 +112,11 @@ function QrImage({ tokenB64 }) {
   })
 }
 
+export function startResendCountdown(setResendIn, schedule = globalThis.setInterval, cancel = globalThis.clearInterval) {
+  const timer = schedule(() => setResendIn(value => Math.max(0, value - 1)), 1000)
+  return () => cancel(timer)
+}
+
 export function AuthPanel({ ctx, onAuthorized }) {
   const [mode, setMode] = useState('choose') // choose | phone | qr
   const [stage, setStage] = useState('idle') // backend auth stage
@@ -131,6 +136,10 @@ export function AuthPanel({ ctx, onAuthorized }) {
   const [me, setMe] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    if (resendIn <= 0) return
+    return startResendCountdown(setResendIn)
+  }, [resendIn > 0])
   const live = useRef({})
   const authorizedCallback = useRef(onAuthorized)
   authorizedCallback.current = onAuthorized

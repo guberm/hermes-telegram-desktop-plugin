@@ -70,7 +70,8 @@ class AuthStateTests(unittest.IsolatedAsyncioTestCase):
         self.types_patch = patch.object(auth, "_auth_types", return_value=AuthTypes)
         self.types_patch.start()
         self.addCleanup(self.types_patch.stop)
-        auth._VOLATILE_STATE = {}
+        auth._VOLATILE_STATE.clear()
+        auth._QR_TASK.clear()
 
     async def test_sent_code_union_keeps_challenge_only_in_memory(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -149,8 +150,100 @@ class AuthStateTests(unittest.IsolatedAsyncioTestCase):
                 for secret in ("+15551234567", "hash", "123456"):
                     self.assertNotIn(secret, data)
                 self.assertEqual(auth._read_state()["stage"], "sent-code")
-                auth._VOLATILE_STATE = {}
+                auth._VOLATILE_STATE.clear()
+                auth._QR_TASK.clear()
                 self.assertEqual(auth._read_state()["stage"], "idle")
+
+    async def test_two_profile_paths_isolate_challenges_tokens_and_qr_cancellation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            roots = {name: Path(temp) / name for name in ("profile-a", "profile-b")}
+            paths = {name: root / "auth_state.json" for name, root in roots.items()}
+            for path in paths.values():
+                path.parent.mkdir()
+            with patch.object(auth, "_state_path", side_effect=lambda: Path(auth._profile_key()).parent / "auth_state.json"):
+                for name, stage, phone_hash, token_value in (
+                    ("profile-a", "sent-code", "hash-a", ""),
+                    ("profile-b", "qr-pending", "", "token-b"),
+                ):
+                    context = auth._ACTIVE_SESSION_KEY.set(str(roots[name] / "session"))
+                    try:
+                        auth._write_state({"stage": stage, "phone": "+15551234567" if phone_hash else "",
+                                           "phoneCodeHash": phone_hash, "qr_token_b64": token_value})
+                    finally:
+                        auth._ACTIVE_SESSION_KEY.reset(context)
+
+                states = {}
+                for name in roots:
+                    context = auth._ACTIVE_SESSION_KEY.set(str(roots[name] / "session"))
+                    try:
+                        states[name] = auth._read_state()
+                    finally:
+                        auth._ACTIVE_SESSION_KEY.reset(context)
+                self.assertEqual((states["profile-a"]["stage"], states["profile-a"]["phoneCodeHash"]), ("sent-code", "hash-a"))
+                self.assertNotEqual(states["profile-a"].get("qr_token_b64"), "token-b")
+                self.assertEqual((states["profile-b"]["stage"], states["profile-b"]["qr_token_b64"]), ("qr-pending", "token-b"))
+                self.assertNotEqual(states["profile-b"].get("phoneCodeHash"), "hash-a")
+
+                class FakeTask:
+                    def __init__(self): self.cancelled = False
+                    def cancel(self): self.cancelled = True
+                task_a, task_b = FakeTask(), FakeTask()
+                key_a, key_b = str(roots["profile-a"] / "session"), str(roots["profile-b"] / "session")
+                auth._QR_TASK.update({key_a: task_a, key_b: task_b})
+                class FakeClient:
+                    async def __call__(self, request): return True
+                manager = SimpleNamespace(client=FakeClient())
+                with patch.object(auth, "_manager", return_value=manager):
+                    context = auth._ACTIVE_SESSION_KEY.set(key_a)
+                    try:
+                        await auth._cancel()
+                        self.assertTrue(task_a.cancelled)
+                        self.assertFalse(task_b.cancelled)
+                        self.assertNotIn(key_a, auth._QR_TASK)
+                        self.assertIs(auth._QR_TASK[key_b], task_b)
+                        self.assertEqual(auth._read_state()["stage"], "idle")
+
+                        # A new QR flow in A must not cancel or replace B's task.
+                        from telethon import types
+                        from datetime import datetime, timezone, timedelta
+                        class FakeQr:
+                            def __init__(self):
+                                self._resp = types.auth.LoginToken(expires=datetime.now(timezone.utc) + timedelta(seconds=30), token=b"a")
+                                self.token = b"a"
+                                self.expires = self._resp.expires
+                        class StartClient:
+                            async def is_user_authorized(self): return False
+                            async def qr_login(self): return FakeQr()
+                            def add_event_handler(self, *args): pass
+                            def remove_event_handler(self, *args): pass
+                        start_manager = SimpleNamespace(client=StartClient(), _lock=asyncio.Lock())
+                        async def hold_waiter(client, qr): await asyncio.Event().wait()
+                        with patch.object(auth, "_manager", return_value=start_manager):
+                            with patch.object(auth, "_qr_wait_loop", new=hold_waiter):
+                                result = await auth._qr_start()
+                        self.assertEqual(result["stage"], "qr-pending")
+                        self.assertIs(auth._QR_TASK[key_b], task_b)
+                        self.assertFalse(task_b.cancelled)
+                        other_profile = auth._ACTIVE_SESSION_KEY.set(key_b)
+                        try:
+                            state_b_after_a_cancel_start = auth._read_state()
+                        finally:
+                            auth._ACTIVE_SESSION_KEY.reset(other_profile)
+                        self.assertEqual(state_b_after_a_cancel_start["stage"], "qr-pending")
+                        self.assertEqual(state_b_after_a_cancel_start["qr_token_b64"], "token-b")
+                        auth._QR_TASK[key_a].cancel()
+                        await asyncio.gather(auth._QR_TASK[key_a], return_exceptions=True)
+                    finally:
+                        auth._ACTIVE_SESSION_KEY.reset(context)
+                        auth._QR_TASK.pop(key_a, None)
+                        auth._QR_TASK.pop(key_b, None)
+
+    def test_password_recovery_start_post_route_is_registered(self):
+        self.assertIn(("POST", "/auth/password-recovery"), {
+            (method, route.path)
+            for route in auth.router.routes
+            for method in getattr(route, "methods", set())
+        })
 
 
 class ManagerTests(unittest.TestCase):
@@ -284,32 +377,102 @@ class TelethonQrHelperTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_qr_expiry_refresh_uses_server_deadline_and_recreates(self):
         from datetime import datetime, timezone, timedelta
-        from telethon import types
+        from telethon import functions, types
         class FakeClient:
-            def __init__(self): self.handlers = []; self.exported = asyncio.Event()
+            def __init__(self): self.handlers = []; self.exported = asyncio.Event(); self.calls = []; self.qr = None
             def add_event_handler(self, handler, event): self.handlers.append(handler)
             def remove_event_handler(self, handler): self.handlers.remove(handler)
+            async def __call__(self, request):
+                self.calls.append(request)
+                self.exported.set()
+                self.qr.expires = datetime.now(timezone.utc) + timedelta(seconds=30)
+                self.qr.token = b"refreshed"
+                self.qr.refreshed.set()
+                return types.auth.LoginToken(expires=self.qr.expires, token=self.qr.token)
         class FakeQr:
             expires = datetime.now(timezone.utc) - timedelta(seconds=1)
             token = b"old"
-            async def recreate(self):
-                self.token = b"refreshed"
-                self.expires = datetime.now(timezone.utc) + timedelta(seconds=30)
-                self.refreshed.set()
             refreshed = asyncio.Event()
         client, qr = FakeClient(), FakeQr()
+        client.qr = qr
         manager = SimpleNamespace(_lock=asyncio.Lock())
         with tempfile.TemporaryDirectory() as temp, \
              patch.object(auth, "_manager", return_value=manager), \
              patch.object(auth, "_api_module", return_value=SimpleNamespace(_load_telegram_credentials=lambda: (1, "hash"))), \
              patch.object(auth, "_state_path", return_value=Path(temp) / "state.json"):
-            task = asyncio.create_task(auth._qr_wait_loop(client, qr))
-            await asyncio.wait_for(qr.refreshed.wait(), timeout=1)
-            self.assertEqual(auth._read_state()["qr_token_b64"], "cmVmcmVzaGVk")
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
+            context = auth._ACTIVE_SESSION_KEY.set(str(Path(temp) / "session"))
+            try:
+                task = asyncio.create_task(auth._qr_wait_loop(client, qr))
+                await asyncio.wait_for(qr.refreshed.wait(), timeout=1)
+                self.assertEqual(auth._read_state()["qr_token_b64"], "cmVmcmVzaGVk")
+                self.assertIsInstance(client.calls[0], functions.auth.ExportLoginTokenRequest)
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            finally:
+                auth._ACTIVE_SESSION_KEY.reset(context)
         self.assertEqual(client.handlers, [])
+
+    async def test_qr_expiry_processes_success_migration_and_unsupported_union(self):
+        from datetime import datetime, timezone, timedelta
+        from telethon import functions, types
+        user = types.User(id=7, first_name="Ada", last_name="", phone="123", username=None, access_hash=1)
+        authorization = types.auth.Authorization(user=user, tmp_sessions=None, future_auth_token=None)
+
+        async def run_expiry(exported, imported=None):
+            class FakeClient:
+                def __init__(self): self.handlers = []; self.calls = []; self.finished = asyncio.Event(); self.logged_in = None; self.switched = []
+                def add_event_handler(self, handler, event): self.handlers.append(handler)
+                def remove_event_handler(self, handler): self.handlers.remove(handler)
+                async def __call__(self, request):
+                    self.calls.append(request)
+                    if isinstance(request, functions.auth.ImportLoginTokenRequest):
+                        return imported
+                    return exported
+                async def _switch_dc(self, dc_id): self.switched.append(dc_id)
+                async def _on_login(self, value): self.logged_in = value
+                async def get_me(self): return user
+            class FakeQr:
+                expires = datetime.now(timezone.utc) - timedelta(seconds=1)
+                token = b"old"
+            client, qr = FakeClient(), FakeQr()
+            profile = str(Path(tempfile.gettempdir()) / f"qr-expiry-{id(client)}" / "session")
+            context = auth._ACTIVE_SESSION_KEY.set(profile)
+            try:
+                manager = SimpleNamespace(_lock=asyncio.Lock())
+                with tempfile.TemporaryDirectory() as temp:
+                    with patch.object(auth, "_manager", return_value=manager):
+                        with patch.object(auth, "_api_module", return_value=SimpleNamespace(_load_telegram_credentials=lambda: (1, "hash"))):
+                            with patch.object(auth, "_state_path", return_value=Path(temp) / "state.json"):
+                                task = asyncio.create_task(auth._qr_wait_loop(client, qr))
+                                for _ in range(100):
+                                    if client.calls or task.done(): break
+                                    await asyncio.sleep(0.001)
+                                if not task.done():
+                                    await asyncio.sleep(0.01)
+                                state = auth._read_state()
+                                task.cancel()
+                                await asyncio.gather(task, return_exceptions=True)
+                                return state, client
+            finally:
+                auth._ACTIVE_SESSION_KEY.reset(context)
+
+        success, client = await run_expiry(types.auth.LoginTokenSuccess(authorization=authorization))
+        self.assertEqual(success["stage"], "done")
+        self.assertIs(client.logged_in, user)
+        self.assertEqual(len(client.calls), 1)
+
+        migration, client = await run_expiry(
+            types.auth.LoginTokenMigrateTo(dc_id=4, token=b"migrate"),
+            types.auth.LoginTokenSuccess(authorization=authorization),
+        )
+        self.assertEqual(migration["stage"], "done")
+        self.assertEqual(client.switched, [4])
+        self.assertEqual(len(client.calls), 2)
+        self.assertIsInstance(client.calls[1], functions.auth.ImportLoginTokenRequest)
+
+        unsupported, client = await run_expiry(object())
+        self.assertEqual(unsupported["stage"], "error")
+        self.assertEqual(len(client.calls), 1)
 
     async def test_own_qr_result_helper_encodes_token_union_branch(self):
         from datetime import datetime, timezone, timedelta

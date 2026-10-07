@@ -21,11 +21,39 @@ test('auth UI uses only approved runtime imports and reaches the auth endpoints'
   // be bundled inline rather than imported as a bare package.
   assert.doesNotMatch(source, /import\s*\(\s*['"]qrcode['"]\s*\)/)
   assert.match(source, /export function AuthPanel\(/)
-  for (const endpoint of ['/auth/start-phone', '/auth/submit-code', '/auth/submit-password', '/auth/qr-start', '/auth/qr-poll']) {
+  for (const endpoint of ['/auth/start-phone', '/auth/submit-code', '/auth/submit-password', '/auth/qr-start', '/auth/qr-poll', '/auth/password-recovery']) {
     assert.ok(source.includes(endpoint), `AuthPanel wires ${endpoint}`)
   }
   assert.match(source, /Sign in to Telegram/)
   assert.match(source, /invalidateQueries\(\{ queryKey: \[\.\.\.prefix, 'status'\]/)
+  assert.match(source, /async function requestPasswordRecovery\(\)[\s\S]*?ctx\.rest\('\/auth\/password-recovery', \{ method: 'POST'/)
+})
+
+test('password-recovery UI posts to the start route and applies its returned auth stage', () => {
+  const start = source.indexOf('async function requestPasswordRecovery()')
+  const end = source.indexOf('\n  async function verifyPasswordRecovery()', start)
+  const flow = source.slice(start, end)
+  assert.match(flow, /ctx\.rest\('\/auth\/password-recovery', \{ method: 'POST', timeoutMs: 40000 \}\)/)
+  assert.match(flow, /applyAuthState\(await ctx\.rest/)
+  assert.match(flow, /finally \{ setBusy\(false\) \}/)
+})
+
+test('resend countdown ticks each second, clamps to zero, and cleans up its timer', () => {
+  const countdown = loadFunction('startResendCountdown')
+  let tick
+  let delay
+  let cancelled
+  let state = 2
+  const cleanup = countdown(update => { state = update(state) }, (callback, ms) => { tick = callback; delay = ms; return 42 }, id => { cancelled = id })
+  assert.equal(delay, 1000)
+  tick()
+  assert.equal(state, 1)
+  tick()
+  assert.equal(state, 0)
+  tick()
+  assert.equal(state, 0)
+  cleanup()
+  assert.equal(cancelled, 42)
 })
 
 test('bundled login QR encoder returns a structurally valid matrix', () => {

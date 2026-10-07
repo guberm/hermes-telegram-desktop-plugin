@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import importlib.util
 import json
 import sys
@@ -17,8 +18,9 @@ from pydantic import BaseModel, ConfigDict, StringConstraints
 
 router = APIRouter()
 _LOCK = threading.RLock()
-_VOLATILE_STATE: dict[str, Any] = {}
-_QR_TASK: asyncio.Task[Any] | None = None
+_VOLATILE_STATE: dict[str, dict[str, Any]] = {}
+_QR_TASK: dict[str, asyncio.Task[Any]] = {}
+_ACTIVE_SESSION_KEY: contextvars.ContextVar[str | None] = contextvars.ContextVar("telegram_auth_session_key", default=None)
 _AUTH_TIMEOUT_SECONDS = 90.0
 _TRANSIENT_AUTH_FIELDS = {"phone", "phoneCodeHash", "qr_token_b64", "qr_expiry", "codeType", "nextType", "resendAt", "emailPurpose", "email", "emailCodeSent", "hint", "hasRecovery", "emailPattern", "recoveryEmailPattern", "recoveryCode", "password", "code"}
 _PHONE_RE_OK = r"^\+[1-9][0-9]{4,14}$"
@@ -82,8 +84,7 @@ def _manager() -> Any:
 
 
 def _auth_dir() -> Path:
-    from hermes_constants import get_hermes_home
-    path = Path(get_hermes_home()) / "telegram-plugin-auth"
+    path = Path(_profile_key()).expanduser().resolve(strict=False).parent
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         path.chmod(0o700)
@@ -96,8 +97,15 @@ def _state_path() -> Path:
     return _auth_dir() / "auth_state.json"
 
 
+def _profile_key() -> str:
+    active = _ACTIVE_SESSION_KEY.get()
+    if active:
+        return active
+    return str(_api_module()._dedicated_session_path().expanduser().resolve(strict=False))
+
+
 def _read_state() -> dict[str, Any]:
-    global _VOLATILE_STATE
+    profile_key = _profile_key()
     path = _state_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -114,10 +122,11 @@ def _read_state() -> dict[str, Any]:
         _persist(data)
     # All active login challenges, including password and QR waiters, are
     # process-local. A restart must require a fresh flow, not fake recovery.
-    if data.get("stage") in {"sent-code", "email-setup", "email-code", "password", "password-recovery", "qr-pending"} and not _VOLATILE_STATE:
+    volatile = _VOLATILE_STATE.get(profile_key, {})
+    if data.get("stage") in {"sent-code", "email-setup", "email-code", "password", "password-recovery", "qr-pending"} and not volatile:
         data = {"stage": "idle"}
         _persist(data)
-    return {**data, **_VOLATILE_STATE}
+    return {**data, **volatile}
 
 
 def _persist(state: dict[str, Any]) -> None:
@@ -131,11 +140,11 @@ def _persist(state: dict[str, Any]) -> None:
 
 
 def _write_state(state: dict[str, Any]) -> None:
-    global _VOLATILE_STATE
+    profile_key = _profile_key()
     if state.get("stage") in {"sent-code", "email-setup", "email-code", "password", "password-recovery", "qr-pending"}:
-        _VOLATILE_STATE = {"stage": state["stage"], **{key: value for key, value in state.items() if key in _TRANSIENT_AUTH_FIELDS}}
+        _VOLATILE_STATE[profile_key] = {"stage": state["stage"], **{key: value for key, value in state.items() if key in _TRANSIENT_AUTH_FIELDS}}
     else:
-        _VOLATILE_STATE = {}
+        _VOLATILE_STATE.pop(profile_key, None)
     _persist(state)
 
 
@@ -166,8 +175,17 @@ def _run(coro: Any, *, timeout: float = 90.0) -> Any:
 
 
 def _route(coro: Any, *, timeout: float = 90.0) -> Any:
+    profile_key = _profile_key()
+
+    async def run_scoped() -> Any:
+        token = _ACTIVE_SESSION_KEY.set(profile_key)
+        try:
+            return await coro
+        finally:
+            _ACTIVE_SESSION_KEY.reset(token)
+
     try:
-        return _run(coro, timeout=timeout)
+        return _run(run_scoped(), timeout=timeout)
     except _FloodWait as exc:
         raise HTTPException(status_code=429, detail={"message": "Telegram rate limit.", "retryAfter": exc.seconds}) from None
     except _AuthFlowError as exc:
@@ -204,11 +222,12 @@ async def _finish_authorization(client: Any, authorization: Any, phone: str = ""
 async def _password_stage(client: Any) -> dict[str, Any]:
     from telethon import functions
     data = await client(functions.account.GetPasswordRequest())
-    state = {"stage": "password", "phone": _VOLATILE_STATE.get("phone", ""),
+    volatile = _VOLATILE_STATE.get(_profile_key(), {})
+    state = {"stage": "password", "phone": volatile.get("phone", ""),
              "hint": getattr(data, "hint", "") or "", "hasRecovery": bool(getattr(data, "has_recovery", False)),
              "emailPattern": getattr(data, "email_unconfirmed_pattern", "") or ""}
     _write_state(state)
-    return _public_stage({**state, **_VOLATILE_STATE})
+    return _public_stage({**state, **volatile})
 
 
 async def _handle_sent_code(client: Any, phone: str, sent: Any, *, email_purpose: Any = None) -> dict[str, Any]:
@@ -235,7 +254,7 @@ async def _handle_sent_code(client: Any, phone: str, sent: Any, *, email_purpose
     if stage == "email-setup":
         state["emailPattern"] = getattr(sent.type, "email_pattern", "") or ""
     _write_state(state)
-    return _public_stage({**state, **_VOLATILE_STATE})
+    return _public_stage({**state, **_VOLATILE_STATE.get(_profile_key(), {})})
 
 
 def _typed_error(exc: BaseException, *, password: bool = False) -> _AuthFlowError | None:
@@ -377,7 +396,8 @@ async def _password_recovery_request() -> dict[str, Any]:
     from telethon import functions
     if _read_state().get("stage") != "password":
         raise _AuthFlowError("Password recovery is available only at the 2FA step.")
-    if not _VOLATILE_STATE.get("hasRecovery"):
+    volatile = _VOLATILE_STATE.get(_profile_key(), {})
+    if not volatile.get("hasRecovery"):
         raise _AuthFlowError("No Telegram recovery email is available for this account.")
     client = _manager().client
     try:
@@ -386,10 +406,10 @@ async def _password_recovery_request() -> dict[str, Any]:
         mapped = _typed_error(exc, password=True)
         if mapped: raise mapped from None
         raise
-    state = {**_VOLATILE_STATE, "stage": "password-recovery",
+    state = {**volatile, "stage": "password-recovery",
              "recoveryEmailPattern": getattr(result, "email_pattern", "") or ""}
     _write_state(state)
-    return _public_stage({**state, **_VOLATILE_STATE})
+    return _public_stage({**state, **_VOLATILE_STATE.get(_profile_key(), {})})
 
 
 async def _password_recovery_verify(code: str) -> dict[str, Any]:
@@ -460,7 +480,7 @@ async def _handle_qr_result(client: Any, result: Any) -> tuple[dict[str, Any], A
 
 
 async def _qr_wait_loop(client: Any, qr: Any) -> None:
-    global _QR_TASK
+    profile_key = _profile_key()
     from telethon import events, functions, types
     manager = _manager()
     update_event = asyncio.Event()
@@ -479,10 +499,14 @@ async def _qr_wait_loop(client: Any, qr: Any) -> None:
                 await asyncio.wait_for(update_event.wait(), timeout=remaining)
             except asyncio.TimeoutError:
                 async with manager._lock:
-                    await qr.recreate()
-                    _write_state({**_VOLATILE_STATE, "stage": "qr-pending",
-                                  "qr_token_b64": _qr_token_b64(qr.token),
-                                  "qr_expiry": qr.expires.timestamp()})
+                    api_id, api_hash = _api_module()._load_telegram_credentials()
+                    result = await client(functions.auth.ExportLoginTokenRequest(api_id, api_hash, []))
+                    state, refreshed = await _handle_qr_result(client, result)
+                    if refreshed is not None:
+                        qr._resp = refreshed
+                    _write_state(state)
+                if state["stage"] != "qr-pending":
+                    return
                 continue
             update_event.clear()
             async with manager._lock:
@@ -505,8 +529,8 @@ async def _qr_wait_loop(client: Any, qr: Any) -> None:
             _write_state({"stage": "error", "error": "Telegram QR authorization failed."})
     finally:
         client.remove_event_handler(on_login_token)
-        if _QR_TASK is asyncio.current_task():
-            _QR_TASK = None
+        if _QR_TASK.get(profile_key) is asyncio.current_task():
+            _QR_TASK.pop(profile_key, None)
 
 
 
@@ -517,7 +541,7 @@ def _qr_token_b64(token: Any) -> str:
 
 
 async def _qr_start() -> dict[str, Any]:
-    global _QR_TASK
+    profile_key = _profile_key()
     from telethon import errors
     state = _read_state()
     client = _manager().client
@@ -526,8 +550,9 @@ async def _qr_start() -> dict[str, Any]:
         done = {"stage": "done", "me": getattr(me, "first_name", "") or ""}
         _write_state(done)
         return _public_stage(done)
-    if _QR_TASK is not None:
-        _QR_TASK.cancel()
+    old_task = _QR_TASK.get(profile_key)
+    if old_task is not None:
+        old_task.cancel()
     try:
         qr = await client.qr_login()
     except Exception as exc:
@@ -547,8 +572,8 @@ async def _qr_start() -> dict[str, Any]:
     expiry = qr.expires
     pending = {"stage": "qr-pending", "qr_token_b64": _qr_token_b64(qr.token), "qr_expiry": expiry.timestamp()}
     _write_state(pending)
-    _QR_TASK = asyncio.create_task(_qr_wait_loop(client, qr), name="telegram-qr-login-waiter")
-    return _public_stage({**pending, **_VOLATILE_STATE})
+    _QR_TASK[profile_key] = asyncio.create_task(_qr_wait_loop(client, qr), name="telegram-qr-login-waiter")
+    return _public_stage({**pending, **_VOLATILE_STATE.get(profile_key, {})})
 
 
 async def _qr_poll() -> dict[str, Any]:
@@ -559,12 +584,12 @@ async def _qr_poll() -> dict[str, Any]:
 
 
 async def _cancel() -> None:
-    global _QR_TASK
+    profile_key = _profile_key()
     state = _read_state()
     client = _manager().client
-    if _QR_TASK is not None:
-        _QR_TASK.cancel()
-        _QR_TASK = None
+    qr_task = _QR_TASK.pop(profile_key, None)
+    if qr_task is not None:
+        qr_task.cancel()
     if state.get("phoneCodeHash") and state.get("stage") in {"sent-code", "email-code", "email-setup"}:
         from telethon import functions
         try:
@@ -576,10 +601,10 @@ async def _cancel() -> None:
 
 
 async def _logout() -> None:
-    global _QR_TASK
-    if _QR_TASK is not None:
-        _QR_TASK.cancel()
-        _QR_TASK = None
+    profile_key = _profile_key()
+    qr_task = _QR_TASK.pop(profile_key, None)
+    if qr_task is not None:
+        qr_task.cancel()
     manager = _manager()
     client = manager.client
     if await client.is_user_authorized():
@@ -628,6 +653,7 @@ def auth_verify_email_setup(request: Request, body: EmailCodeRequest) -> dict[st
     with _LOCK: return _route(_verify_email_setup(body.code))
 
 
+@router.post("/auth/password-recovery")
 def auth_password_recovery(request: Request) -> dict[str, Any]:
     _reject_extras(request)
     with _LOCK: return _route(_password_recovery_request())
