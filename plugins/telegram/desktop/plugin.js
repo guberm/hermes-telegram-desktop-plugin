@@ -243,7 +243,13 @@ export function AuthPanel({ ctx, onAuthorized }) {
     try {
       const result = await ctx.rest('/auth/submit-password', { method: 'POST', body: { password }, timeoutMs: 40000 })
       applyAuthState(result)
-    } catch (e) { setError(errorText(e)) } finally { setPassword(''); setBusy(false) }
+    } catch (e) {
+      // A transient backend failure must not bounce the user back to the
+      // start of the login flow while the password stage is still active.
+      setError(errorText(e))
+      try { applyAuthState(await ctx.rest('/auth/state', { timeoutMs: 20000 })) }
+      catch { /* keep the current stage and show the error */ }
+    } finally { setPassword(''); setBusy(false) }
   }
   async function requestPasswordRecovery() {
     setBusy(true); setError('')

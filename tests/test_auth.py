@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import sys
 import tempfile
 import threading
@@ -145,14 +146,32 @@ class AuthStateTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "state.json"
             with patch.object(auth, "_state_path", return_value=path):
-                auth._write_state({"stage": "sent-code", "phone": "+15551234567", "phoneCodeHash": "hash", "code": "123456"})
+                auth._write_state({"stage": "sent-code", "phone": "+155****4567", "phoneCodeHash": "hash", "code": "123456"})
                 data = path.read_text()
-                for secret in ("+15551234567", "hash", "123456"):
+                for secret in ("+155****4567", "hash", "123456"):
                     self.assertNotIn(secret, data)
                 self.assertEqual(auth._read_state()["stage"], "sent-code")
                 auth._VOLATILE_STATE.clear()
                 auth._QR_TASK.clear()
                 self.assertEqual(auth._read_state()["stage"], "idle")
+
+    async def test_password_stage_survives_backend_restart_without_secrets(self):
+        # The password stage carries no transient secret (SRP material is
+        # fetched fresh at submit), so a backend restart must keep the UI on
+        # the password field instead of bouncing back to the login screen.
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "state.json"
+            with patch.object(auth, "_state_path", return_value=path):
+                auth._write_state({"stage": "password", "hint": "first pet", "hasRecovery": True, "emailPattern": "x@y.com"})
+                persisted = json.loads(path.read_text())
+                self.assertEqual(persisted.get("stage"), "password")
+                self.assertNotIn("hint", persisted)  # hint is display-only, stays volatile
+                auth._VOLATILE_STATE.clear()
+                auth._QR_TASK.clear()
+                resumed = auth._read_state()
+                self.assertEqual(resumed["stage"], "password")
+                # cleanup the persisted marker
+                auth._write_state({"stage": "idle"})
 
     async def test_two_profile_paths_isolate_challenges_tokens_and_qr_cancellation(self):
         with tempfile.TemporaryDirectory() as temp:

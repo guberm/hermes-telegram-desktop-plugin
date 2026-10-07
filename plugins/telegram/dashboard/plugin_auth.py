@@ -120,10 +120,12 @@ def _read_state() -> dict[str, Any]:
             changed = True
     if changed:
         _persist(data)
-    # All active login challenges, including password and QR waiters, are
-    # process-local. A restart must require a fresh flow, not fake recovery.
+    # Challenges that depend on in-memory secrets (sent-code hash, QR token)
+    # die with the process: a restart must require a fresh flow. The password
+    # stage carries no secret (SRP material is fetched fresh at submit), so it
+    # survives a backend restart and the UI must stay on the password field.
     volatile = _VOLATILE_STATE.get(profile_key, {})
-    if data.get("stage") in {"sent-code", "email-setup", "email-code", "password", "password-recovery", "qr-pending"} and not volatile:
+    if data.get("stage") in {"sent-code", "email-setup", "email-code", "password-recovery", "qr-pending"} and not volatile:
         data = {"stage": "idle"}
         _persist(data)
     return {**data, **volatile}
@@ -142,7 +144,13 @@ def _persist(state: dict[str, Any]) -> None:
 def _write_state(state: dict[str, Any]) -> None:
     profile_key = _profile_key()
     if state.get("stage") in {"sent-code", "email-setup", "email-code", "password", "password-recovery", "qr-pending"}:
-        _VOLATILE_STATE[profile_key] = {"stage": state["stage"], **{key: value for key, value in state.items() if key in _TRANSIENT_AUTH_FIELDS}}
+        transient = {key: value for key, value in state.items() if key in _TRANSIENT_AUTH_FIELDS}
+        if transient:
+            _VOLATILE_STATE[profile_key] = {"stage": state["stage"], **transient}
+        elif state.get("stage") not in {"password", "password-recovery"}:
+            _VOLATILE_STATE[profile_key] = {"stage": state["stage"]}
+        elif profile_key in _VOLATILE_STATE:
+            _VOLATILE_STATE[profile_key]["stage"] = state["stage"]
     else:
         _VOLATILE_STATE.pop(profile_key, None)
     _persist(state)
