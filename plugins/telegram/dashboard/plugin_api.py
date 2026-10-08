@@ -1009,8 +1009,15 @@ def messages(
 
 
 async def _me_id(client: Any) -> int:
+    # get_me() is a network round-trip; the id is stable for the life of the
+    # client object (re-login creates a new client), so cache it per client.
+    cached = getattr(client, "_cached_me_id", None)
+    if cached is not None:
+        return int(cached)
     me = await client.get_me()
-    return int(getattr(me, "id", 0) or 0)
+    cached = int(getattr(me, "id", 0) or 0)
+    client._cached_me_id = cached
+    return cached
 
 
 # --- Prepare / commit ---------------------------------------------------------
@@ -1260,9 +1267,11 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
                 unread_after = int(getattr(topic, "unread_count", 0) or 0)
                 cursor = int(getattr(topic, "read_inbox_max_id", 0) or 0)
             else:
-                unread_after = await _unread_count_for(client, entity)
-                fresh = await client.get_dialogs(limit=_DIALOG_SNAPSHOT_LIMIT)
+                # One bounded dialogs fetch serves both the unread count and
+                # the read cursor; a second full fetch doubled the latency.
+                fresh = await client.get_dialogs(limit=200)
                 after_dialog = next((d for d in fresh if _dialog_match(d, entity)), None)
+                unread_after = int(getattr(after_dialog, "unread_count", 0) or 0) if after_dialog is not None else 0
                 cursor = _dialog_read_cursor(after_dialog) if after_dialog is not None else 0
             # A bounded read must advance the exact chat/topic cursor through
             # the requested post; newer posts may remain unread.

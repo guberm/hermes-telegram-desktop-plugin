@@ -859,6 +859,28 @@ class MarkReadActionTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(self.reads, [], "stale preview must not mark anything read")
 
+    def test_commit_mark_read_readback_fetches_dialogs_once(self):
+        # Latency: the readback needs one bounded dialogs fetch for both the
+        # unread count and the read cursor; a second full fetch doubles it.
+        calls: list[int] = []
+        prepared = MODULE.prepare_action(self.request, MODULE.MarkReadPrepare(
+            scope=self.scope, action="mark-read", peer="@group", maxId=321,
+        ))
+        # Wrap the mock client's get_dialogs to count calls.
+        async def counting_get_dialogs(inner, limit=0):
+            calls.append(int(limit))
+            return [self.dialog]
+        self.client.__class__.get_dialogs = counting_get_dialogs  # type: ignore[method-assign]
+        try:
+            result = MODULE.commit_action(self.request, MODULE.CommitRequest(
+                scope=self.scope, confirmationToken=prepared["confirmationToken"], confirmed=True,
+            ))
+        finally:
+            del self.client.__class__.get_dialogs  # restore original mock method
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(len(calls), 1, f"expected one get_dialogs call, got {calls}")
+        self.assertLessEqual(calls[0], 200, "readback fetch must stay bounded")
+
 
 class ForumTopicsRouteTests(unittest.TestCase):
     def test_topics_serialization_and_nonforum_detection(self):

@@ -484,7 +484,7 @@ export function contextText(me, message) {
     JSON.stringify({ source: 'telegram', me, ...message }, null, 2)
 }
 
-const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: 'all' })
+const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
 const settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`
 
 export function renderMediaPreview(message) {
@@ -509,6 +509,7 @@ export function loadSettings(storage, key) {
       autoRefresh: raw.autoRefresh === true,
       unmutedOnly: raw.unmutedOnly === true,
       unreadOnly: raw.unreadOnly === true,
+      confirmActions: raw.confirmActions !== false,
       tab: typeof raw.tab === 'string' && /^(?:all|archive|\d{1,10})$/.test(raw.tab) ? raw.tab : 'all',
     }
   } catch { return { ...DEFAULT_SETTINGS } }
@@ -654,13 +655,18 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
   async function prepareAndConfirm(body) {
     if (guard.current || statusUnavailable) return
     guard.current = true; setBusy(true); setFeedback(null)
+    let prepared = null
     try {
-      const prepared = await mutation.mutateAsync({ path: '/actions/prepare', body: { scope, ...body } })
+      prepared = await mutation.mutateAsync({ path: '/actions/prepare', body: { scope, ...body } })
       if (prepared.scope !== scope || !prepared.confirmationToken || !prepared.preview) throw new Error('Invalid preview')
-      if (mounted.current) setTicket(prepared)
+      if (settings.confirmActions && mounted.current) setTicket(prepared)
     } catch (error) {
+      prepared = null
       if (mounted.current) setFeedback({ error: true, text: `Could not prepare this action. No change requested. ${error?.message || ''}` })
     } finally { mutation.reset(); guard.current = false; if (mounted.current) setBusy(false) }
+    // Confirmation off: prepare already validated the ticket, so commit
+    // immediately (after the guard release — commit holds the guard itself).
+    if (!settings.confirmActions && prepared) return await commit(prepared)
   }
 
   async function commit(preparedTicket = ticket) {
@@ -796,6 +802,18 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             color: settings.unmutedOnly ? 'var(--dt-primary-solid-foreground)' : 'var(--ui-text-secondary)',
           },
           children: settings.unmutedOnly ? '🔔 Unmuted only ✓' : '🔔 Unmuted only',
+        }),
+        jsx('button', {
+          type: 'button', role: 'switch', 'aria-checked': settings.confirmActions,
+          onClick: () => setSettings(current => ({ ...current, confirmActions: !current.confirmActions })),
+          style: {
+            border: '1px solid var(--ui-stroke-secondary)', cursor: 'pointer', font: 'inherit',
+            padding: '0.2rem 0.6rem', borderRadius: '0.4rem',
+            background: settings.confirmActions ? 'transparent' : 'var(--ui-danger, var(--ui-stroke-secondary))',
+            color: settings.confirmActions ? 'var(--ui-text-secondary)' : 'var(--dt-primary-solid-foreground)',
+          },
+          children: settings.confirmActions ? 'Confirm actions ✓' : 'Confirm actions off',
+          title: 'When off, send/reply/delete/mark-read run immediately without the confirmation dialog',
         }),
       ] })
     ] }),

@@ -107,7 +107,7 @@ const mediaLabelImpl = new Function(
     .replace('export function mediaLabel', 'function mediaLabel')}\nreturn mediaLabel`,
 )()
 
-const defaults = 'const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: \'all\' })\nconst settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`'
+const defaults = 'const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: \'all\' })\nconst settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`'
 
 function makeTelegramPane(dialogs, messages = []) {
   const slots = []
@@ -180,13 +180,18 @@ function makeTelegramPane(dialogs, messages = []) {
 
 test('settings default to manual refresh', () => {
   const load = loadFunction('loadSettings', 'unreadBadge', defaults)
-  assert.deepEqual(load({ get: () => null }, 'k'), { autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: 'all' })
+  assert.deepEqual(load({ get: () => null }, 'k'), { autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
   assert.deepEqual(load({ get: () => ({ autoRefresh: true, unmutedOnly: true, unreadOnly: true, tab: '42', junk: 1 }) }, 'k'),
-    { autoRefresh: true, unmutedOnly: true, unreadOnly: true, tab: '42' })
+    { autoRefresh: true, unmutedOnly: true, unreadOnly: true, confirmActions: true, tab: '42' })
   assert.deepEqual(load({ get: () => ({ autoRefresh: 'yes', tab: 'nope' }) }, 'k'),
-    { autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: 'all' })
+    { autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
+  // Explicit opt-out is preserved; anything else defaults confirmation on.
+  assert.deepEqual(load({ get: () => ({ confirmActions: false }) }, 'k'),
+    { autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: false, tab: 'all' })
+  assert.deepEqual(load({ get: () => ({ confirmActions: 'no' }) }, 'k'),
+    { autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
   assert.deepEqual(load({ get: () => { throw new Error('storage locked') } }, 'k'),
-    { autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: 'all' })
+    { autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
 })
 
 test('unread badge uses the verified Desktop contrast tokens and readable counts', () => {
@@ -376,6 +381,47 @@ test('mark-read UI prepares exact targets and commits only after confirmation', 
   assert.ok(confirmation?.props.ticket)
   await confirmation.props.onConfirm()
   assert.deepEqual(render.restCalls().map(call => call.path), ['/actions/prepare', '/actions/prepare', '/actions/commit'])
+})
+
+test('confirm-actions toggle: on shows the dialog, off commits immediately', async () => {
+  const render = makeTelegramPane([
+    { key: '@alice', name: 'Alice', muted: false, unread: 2, topMessageId: 42, folderIds: ['all'] },
+  ], [{ id: 15, date: '', mine: false, sender: 'Bob', htmlPreview: 'target', media: '', replyTo: null }])
+  const treeNodes = tree => Array.isArray(tree) ? tree.flatMap(treeNodes)
+    : tree && typeof tree === 'object' ? [tree, ...treeNodes(tree.props?.children)] : []
+  const findToggle = tree => treeNodes(tree).find(node => node.type === 'button'
+    && node.props.role === 'switch' && String(node.props.children).startsWith('Confirm actions'))
+  const clickMarkRead = async tree => {
+    treeNodes(tree).find(node => node.type === 'button' && Array.isArray(node.props.children)
+      && node.props.children[0]?.props?.children === 'Alice').props.onClick()
+    tree = render()
+    treeNodes(tree).find(node => node.type === 'button' && node.props.children === 'Mark read up to here').props.onClick()
+    await new Promise(resolve => setImmediate(resolve))
+    return render()
+  }
+
+  let tree = render()
+  // Default: confirmation on, switch rendered checked.
+  assert.equal(findToggle(tree).props['aria-checked'], true)
+  tree = await clickMarkRead(tree)
+  assert.deepEqual(render.restCalls().map(call => call.path), ['/actions/prepare'])
+  assert.ok(treeNodes(tree).find(node => node.type === 'Confirmation')?.props.ticket, 'dialog shown when confirmation is on')
+
+  // Toggle off: the same action prepares and commits in one step, no dialog.
+  findToggle(tree).props.onClick()
+  tree = render()
+  assert.equal(findToggle(tree).props['aria-checked'], false)
+  render.restCalls().length = 0
+  tree = await clickMarkRead(tree)
+  assert.deepEqual(render.restCalls().map(call => call.path), ['/actions/prepare', '/actions/commit'])
+  assert.equal(treeNodes(tree).find(node => node.type === 'Confirmation')?.props.ticket, null,
+    'no dialog ticket when confirmation is off')
+  assert.match(source, /if \(!settings\.confirmActions && prepared\) return await commit\(prepared\)/)
+
+  // Toggle back on: the dialog returns.
+  findToggle(tree).props.onClick()
+  tree = render()
+  assert.equal(findToggle(tree).props['aria-checked'], true)
 })
 
 test('dialog tabs filter by backend-returned stable folder IDs', () => {
