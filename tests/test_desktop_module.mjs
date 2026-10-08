@@ -224,6 +224,18 @@ test('unread badge uses the verified Desktop contrast tokens and readable counts
   assert.equal(badge(100, false).props.children, '100')
 })
 
+test('forum dialogs badge on the number of topics with unread messages', () => {
+  // In a forum overview the badge must show the topic count (unreadTopics),
+  // not the raw message total; with a topic open it shows that topic's unread
+  // count; a plain dialog keeps the raw unread count. Match each fragment of
+  // the badge expression individually so whitespace churn doesn't break it.
+  assert.match(source, /unreadBadge\(topicId > 0 && activeTopic/)
+  assert.match(source, /\? activeTopic\.unread/)
+  assert.match(source, /: activeDialog\?\.isForum && \(activeDialog\.unreadTopics \|\| 0\) > 0/)
+  assert.match(source, /\? activeDialog\.unreadTopics/)
+  assert.match(source, /: dialog\.unread, dialog\.muted\)/)
+})
+
 test('folder tabs remain horizontally scrollable in a constrained narrow header', () => {
   const start = source.indexOf("const tabBar = jsx('div', { role: 'tablist'")
   const end = source.indexOf("feedback &&", start)

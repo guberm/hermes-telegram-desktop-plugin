@@ -840,7 +840,16 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             },
             children: [
               jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: dialog.unread > 0 && !dialog.muted ? 700 : 400 }, children: `${dialog.muted ? '🔇 ' : ''}${dialog.name || dialog.key}` }),
-              unreadBadge(topicId > 0 && activeTopic ? activeTopic.unread : dialog.unread, dialog.muted),
+              // Badge semantics: with a specific topic open, show that topic's
+              // unread message count; in a forum's overview, show the number of
+              // topics that have unread messages; for a plain dialog, the
+              // unread message count. The raw count stays as a fallback so a
+              // snapshot without topic data still shows *something* unread.
+              unreadBadge(topicId > 0 && activeTopic
+                ? activeTopic.unread
+                : activeDialog?.isForum && (activeDialog.unreadTopics || 0) > 0
+                  ? activeDialog.unreadTopics
+                  : dialog.unread, dialog.muted),
             ]
           }, dialog.key))
         }),

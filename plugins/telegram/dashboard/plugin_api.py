@@ -98,6 +98,10 @@ _MAX_TICKETS = 256
 _MAX_SCOPES = 128
 _MAX_PROVIDER_TEXT = 16 * 1024
 _MAX_MEDIA_PREVIEW_MESSAGES = 6
+# Forum topic scan: GetForumTopicsRequest pages at 100 at a time; bound the
+# total so a pathological forum can't stall the dialogs snapshot.
+_FORUM_TOPIC_PAGE = 100
+_FORUM_TOPIC_SCAN_MAX = 1000
 # Raw photo bytes may be up to 160 KB (a full-size JPEG fits the budget); the
 # base64 data URI bound keeps the JSON payload bounded at ~220 KB.
 _MAX_MEDIA_PREVIEW_BYTES = 160 * 1024
@@ -595,8 +599,14 @@ def _filter_membership(dialog: Any, definition: Any) -> tuple[bool, bool]:
     return True, is_pinned
 
 
-def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Attach backend-computed memberships to dialogs and return stable tabs."""
+def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any], unread_topics: dict[str, int] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Attach backend-computed memberships to dialogs and return stable tabs.
+
+    ``unread_topics`` maps a dialog key to the number of its forum topics that
+    currently have unread messages; it is only present for forum dialogs.
+    """
+
+    unread_topics = unread_topics or {}
 
     folders: list[dict[str, Any]] = [{"id": "all", "title": "All", "kind": "all"}]
     custom: list[tuple[str, Any]] = []
@@ -619,6 +629,7 @@ def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any]) -> tu
     for dialog in dialogs:
         entity = getattr(dialog, "entity", None)
         unread = int(getattr(dialog, "unread_count", 0) or 0)
+        dialog_key = _peer_key(entity)
         raw_folder = getattr(dialog, "folder_id", None)
         archived = raw_folder == 1
         folder_ids = ["archive" if archived else "all"]
@@ -630,9 +641,13 @@ def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any]) -> tu
                 if pinned:
                     folder_pins.append(ident)
         rows.append({
-            "key": _peer_key(entity),
+            "key": dialog_key,
             "name": _peer_display_name(entity),
             "unread": unread,
+            # For a forum the badge should show the number of topics that have
+            # new messages, not the raw message total; for a plain dialog it is
+            # absent and the UI falls back to the message count.
+            "unreadTopics": int(unread_topics.get(dialog_key, 0) or 0),
             "muted": _dialog_is_muted(dialog),
             "folder": int(raw_folder) if raw_folder is not None else 0,
             "folderIds": folder_ids,
@@ -743,17 +758,17 @@ def _consume_ticket(token: str, scope: str) -> Ticket:
 
 
 def _provider_context(binding: _ScopeBinding | None = None) -> tuple[str, str]:
-    """Return (me, home) after verifying the authorized Telethon session."""
+    """Return (me, home) after verifying the authorized Telethon session.
+
+    The account name is served from a short-lived TTL cache keyed on the live
+    client (see ``_me_name``), so the ~6 get_me() calls a single action makes
+    across endpoints collapse to one round-trip.
+    """
 
     home = _current_home()
 
     async def _probe(client: Any) -> str:
-        me = await client.get_me()
-        if me is None:
-            raise _AuthUnavailable("no Telegram account")
-        name = _peer_display_name(me)
-        if not name:
-            raise ValueError("invalid account")
+        name, _ = await _me_name(client, home)
         return name
 
     try:
@@ -855,12 +870,27 @@ def dialogs(
             result: list[Any] = []
             async for dialog in client.iter_dialogs(limit=_DIALOG_SNAPSHOT_LIMIT):
                 result.append(dialog)
+            # For forum dialogs, count the topics that actually have unread
+            # messages so the badge matches the native client (topic count,
+            # not the raw message total). Only real forums pay this cost — a
+            # non-forum megagroup would make the scan pointless.
+            unread_topics: dict[str, int] = {}
+            for dialog in result:
+                entity = getattr(dialog, "entity", None)
+                if entity is None or not getattr(entity, "forum", False):
+                    continue
+                try:
+                    unread_topics[_peer_key(entity)] = await _unread_topics_count(client, entity)
+                except Exception:
+                    # A topic scan must never break the whole dialogs list; fall
+                    # back to the raw unread count (badge still shows something).
+                    pass
             response = await client(functions.messages.GetDialogFiltersRequest())
             telegram_filters = [
                 definition for definition in (getattr(response, "filters", None) or [])
                 if isinstance(definition, (DialogFilter, DialogFilterChatlist))
             ]
-            folders, rows = _apply_dialog_filters(result, telegram_filters)
+            folders, rows = _apply_dialog_filters(result, telegram_filters, unread_topics)
             return {"dialogs": rows, "folders": folders, "fetchedAt": time.time()}
 
         try:
@@ -974,8 +1004,7 @@ def messages(
             # Telethon excludes min_id itself, so use cursor-1 to include the
             # last-read post when it is still available.
             kwargs.update(min_id=cursor - 1, reverse=True)
-        me_entity = await client.get_me()
-        own_id = int(getattr(me_entity, "id", 0) or 0)
+        own_id = await _me_id(client)
         found: list[dict[str, Any]] = []
         preview_count = 0
         async for message in client.iter_messages(entity, **kwargs):
@@ -1025,6 +1054,75 @@ async def _me_id(client: Any) -> int:
     cached = int(getattr(me, "id", 0) or 0)
     client._cached_me_id = cached
     return cached
+
+
+# get_me() is a GetUsers RPC every call — the session name/id never change for
+# the life of the client. Cache the display name per (backend instance, home,
+# client) with a TTL so a single action's ~6 redundant get_me() calls collapse
+# to one. A re-login creates a new client object, so stale entries age out via
+# the TTL and the id() key is never reused within a session.
+_ME_NAME_TTL_SECONDS = 300.0
+_ME_NAME_CACHE_LOCK = threading.Lock()
+_ME_NAME_CACHE: "OrderedDict[tuple[str, str, int], tuple[float, str, int]]" = OrderedDict()
+
+
+async def _me_name(client: Any, home: str) -> tuple[str, int]:
+    key = (_BACKEND_INSTANCE, home, id(client))
+    with _ME_NAME_CACHE_LOCK:
+        entry = _ME_NAME_CACHE.get(key)
+        if entry is not None and time.time() - entry[0] <= _ME_NAME_TTL_SECONDS:
+            _ME_NAME_CACHE.move_to_end(key)
+            return entry[1], entry[2]
+    me = await client.get_me()
+    if me is None:
+        raise _AuthUnavailable("no Telegram account")
+    name = _peer_display_name(me)
+    if not name:
+        raise ValueError("invalid account")
+    me_id = int(getattr(me, "id", 0) or 0)
+    client._cached_me_id = me_id
+    with _ME_NAME_CACHE_LOCK:
+        _ME_NAME_CACHE[key] = (time.time(), name, me_id)
+        _ME_NAME_CACHE.move_to_end(key)
+        while len(_ME_NAME_CACHE) > 32:
+            _ME_NAME_CACHE.popitem(last=False)
+    return name, me_id
+
+
+async def _unread_topics_count(client: Any, entity: Any) -> int:
+    """Number of forum topics with unread messages.
+
+    Telegram does not expose a per-forum topic-count in the dialogs list (the
+    raw Dialog carries only a total message unread_count), so count
+    GetForumTopicsRequest results. Bound the scan so a huge forum stays fast;
+    the first 1000 topics always dominate the unread signal a human would act
+    on, and the result rides on the 20 s dialog snapshot cache.
+    """
+    from telethon import functions
+    from telethon.tl import types as tl_types
+
+    unread_topics = 0
+    offset_date, offset_id, offset_topic = None, 0, 0
+    scanned = 0
+    while scanned < _FORUM_TOPIC_SCAN_MAX:
+        response = await client(functions.messages.GetForumTopicsRequest(
+            peer=entity, offset_date=offset_date, offset_id=offset_id,
+            offset_topic=offset_topic, limit=_FORUM_TOPIC_PAGE,
+        ))
+        topics = list(getattr(response, "topics", None) or [])
+        for topic in topics:
+            if isinstance(topic, tl_types.ForumTopic) and int(getattr(topic, "unread_count", 0) or 0) > 0:
+                unread_topics += 1
+        if len(topics) < _FORUM_TOPIC_PAGE:
+            break
+        last = next((t for t in reversed(topics) if isinstance(t, tl_types.ForumTopic)), None)
+        if last is None:
+            break
+        offset_date = getattr(last, "date", None)
+        offset_id = int(getattr(last, "top_message", 0) or 0)
+        offset_topic = int(getattr(last, "id", 0) or 0)
+        scanned += len(topics)
+    return unread_topics
 
 
 # --- Prepare / commit ---------------------------------------------------------
@@ -1251,7 +1349,10 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
             target = await client.get_messages(entity, ids=payload["messageId"])
             if target is None:
                 raise HTTPException(status_code=409, detail="Message no longer exists; nothing to save.")
-            forwarded = await client.forward_messages("me", [payload["messageId"]])
+            # from_peer is required when forwarding by integer IDs: it tells
+            # Telethon which chat the message belongs to. Without it, the
+            # client raises ValueError before the RPC is sent.
+            forwarded = await client.forward_messages("me", [payload["messageId"]], from_peer=entity)
             sent = forwarded[0] if isinstance(forwarded, list) else forwarded
             return {"sentId": int(sent.id), "peer": name}
         target = await client.get_messages(entity, ids=payload["messageId"])

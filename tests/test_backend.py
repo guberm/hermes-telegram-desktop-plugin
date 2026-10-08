@@ -906,8 +906,8 @@ class SaveActionTests(unittest.TestCase):
                     return self.saved
                 return None
 
-            async def forward_messages(inner, dest, messages):
-                self.forwards.append((dest, messages))
+            async def forward_messages(inner, dest, messages, from_peer=None):
+                self.forwards.append((dest, messages, from_peer))
                 message = SimpleNamespace(
                     id=777,
                     message="keep me",
@@ -951,7 +951,9 @@ class SaveActionTests(unittest.TestCase):
         ))
         self.assertEqual(result["status"], "verified")
         self.assertEqual(result["id"], 777)
-        self.assertEqual(self.forwards, [("me", [321])])
+        # from_peer must be forwarded: without it Telethon raises ValueError
+        # before the RPC is sent, so the live Save action would always fail.
+        self.assertEqual(self.forwards, [("me", [321], self.entity)])
 
     def test_prepare_save_missing_source_fails_closed(self):
         # A vanished source message must be rejected before any ticket exists.
@@ -1070,6 +1072,83 @@ class ForcedRefreshRouteTests(unittest.TestCase):
         self.assertEqual(result["dialogs"][0]["webUsername"], "group")
         self.assertEqual(client.limit, MODULE._DIALOG_SNAPSHOT_LIMIT)
         self.assertEqual(type(client.request).__name__, "GetDialogFiltersRequest")
+
+    def test_forum_dialog_reports_unread_topic_count_not_message_total(self):
+        # Forum badge semantics: the dialogs row must carry the *number of
+        # topics with unread messages*, not the raw message total (which is
+        # what Dialog.unread_count is). A non-forum dialog must not pay the
+        # forum-topic RPC.
+        from telethon.tl import functions as tg_functions
+        from telethon.tl import types as tg_types
+
+        def _topic(unread, top_message, tid):
+            return tg_types.ForumTopic(
+                id=tid, date=None, peer=None, title=f"t{tid}", icon_color=0,
+                top_message=top_message, read_inbox_max_id=0, read_outbox_max_id=0,
+                unread_count=unread, unread_mentions_count=0, unread_reactions_count=0,
+                unread_poll_votes_count=0, from_id=None, notify_settings=None,
+            )
+
+        MODULE._DIALOG_CACHE.clear()
+        scope = "c" * 32
+        forum_entity = SimpleNamespace(id=700, title="Forum Group", username="forum", forum=True, megagroup=True)
+        plain_entity = SimpleNamespace(id=701, title="Plain Group", username="plain", forum=False, megagroup=True)
+        forum_dialog = SimpleNamespace(
+            id=700, entity=forum_entity, unread_count=15, folder_id=None, date=None,
+            message=SimpleNamespace(id=1), dialog=SimpleNamespace(notify_settings=None),
+        )
+        plain_dialog = SimpleNamespace(
+            id=701, entity=plain_entity, unread_count=4, folder_id=None, date=None,
+            message=SimpleNamespace(id=2), dialog=SimpleNamespace(notify_settings=None),
+        )
+        forum_topics = [
+            _topic(unread=3, top_message=101, tid=10),
+            _topic(unread=0, top_message=102, tid=11),
+            _topic(unread=1, top_message=103, tid=12),
+        ]
+
+        class Client:
+            async def iter_dialogs(self, limit):
+                yield forum_dialog
+                yield plain_dialog
+
+            async def __call__(self, request):
+                self.requests = getattr(self, "requests", [])
+                self.requests.append(request)
+                if isinstance(request, tg_functions.messages.GetForumTopicsRequest):
+                    return SimpleNamespace(topics=list(forum_topics))
+                if isinstance(request, tg_functions.messages.GetDialogFiltersRequest):
+                    return SimpleNamespace(filters=[])
+                raise AssertionError(f"unexpected request {type(request)}")
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.dialogs(
+                SimpleNamespace(query_params={}), scope=scope, limit=40,
+                folder="all", unreadOnly=False, refresh=True,
+            )
+        by_name = {row["name"]: row for row in result["dialogs"]}
+        self.assertEqual(by_name["Forum Group"]["unreadTopics"], 2, "2 topics have unread messages")
+        self.assertEqual(by_name["Forum Group"]["unread"], 15, "raw message total is preserved")
+        self.assertEqual(by_name["Plain Group"]["unreadTopics"], 0, "no topics for a plain dialog")
+        self.assertEqual(by_name["Plain Group"]["unread"], 4)
+        # Exactly one forum-topic scan, and only against the forum peer.
+        forum_topic_calls = [r for r in client.requests if isinstance(r, tg_functions.messages.GetForumTopicsRequest)]
+        self.assertEqual(len(forum_topic_calls), 1, "a non-forum must not trigger a topic scan")
+        self.assertIs(forum_topic_calls[0].peer, forum_entity)
+        self.assertTrue(
+            any(isinstance(r, tg_functions.messages.GetDialogFiltersRequest) for r in client.requests),
+            "dialog filters still fetched",
+        )
 
     def test_refresh_true_bypasses_cached_snapshot(self):
         MODULE._DIALOG_CACHE.clear()
