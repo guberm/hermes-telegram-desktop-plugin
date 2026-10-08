@@ -525,7 +525,7 @@ test('message-history action bar is sticky while the history scrolls', () => {
   assert.ok(bar, 'action bar is rendered')
   assert.equal(bar.props.style.position, 'sticky', 'action bar sticks to the top of the scroll container')
   assert.equal(bar.props.style.zIndex, 2, 'action bar renders above the messages')
-  assert.match(String(bar.props.style.background), /var\(--ui-card/)
+  assert.match(String(bar.props.style.background), /var\(--ui-bg-editor/)
   assert.match(source, /position: 'sticky', top: '-0\.5rem', zIndex: 2/)
 })
 
