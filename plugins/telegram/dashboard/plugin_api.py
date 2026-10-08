@@ -97,9 +97,11 @@ _TICKET_TTL_SECONDS = 300.0
 _MAX_TICKETS = 256
 _MAX_SCOPES = 128
 _MAX_PROVIDER_TEXT = 16 * 1024
-_MAX_MEDIA_PREVIEW_MESSAGES = 8
-_MAX_MEDIA_PREVIEW_BYTES = 64 * 1024
-_MAX_MEDIA_PREVIEW_DATA_URI_LENGTH = 88_000
+_MAX_MEDIA_PREVIEW_MESSAGES = 6
+# Raw photo bytes may be up to 160 KB (a full-size JPEG fits the budget); the
+# base64 data URI bound keeps the JSON payload bounded at ~220 KB.
+_MAX_MEDIA_PREVIEW_BYTES = 160 * 1024
+_MAX_MEDIA_PREVIEW_DATA_URI_LENGTH = 240_000
 _TOPIC_ROOT_RE = re.compile(r"^https?://t\.me/c/(\d+)/(?:\d+/)?(\d+)")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,256}$")
 _BACKEND_INSTANCE = secrets.token_urlsafe(24)
@@ -205,7 +207,6 @@ class _InertPreviewSanitizer(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.out: list[str] = []
         self.open_tags: list[str] = []
-        self._link_href: str | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -218,13 +219,13 @@ class _InertPreviewSanitizer(HTMLParser):
         if tag not in self._ALLOWED:
             return
         if tag == "a":
+            # Emit a real anchor carrying the safe href; the link text flows
+            # through handle_data and is rendered exactly once (no bold wrap,
+            # no parenthesized duplicate URL).
             href = next((value for name, value in attrs if name and name.lower() == "href"), None)
             if href and self._SAFE_URL.match(href) and len(href) <= 2048:
-                self._link_href = href
-            else:
-                self._link_href = ""
-            self.out.append("<b>")
-            self.open_tags.append("b")
+                self.out.append(f'<a href="{escape(href, quote=True)}">')
+                self.open_tags.append("a")
             return
         if tag == "code" or tag == "pre":
             self.out.append(f"<{tag}>")
@@ -239,13 +240,10 @@ class _InertPreviewSanitizer(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
         if tag == "a":
-            href = self._link_href
-            self._link_href = None
-            if self.open_tags and self.open_tags[-1] == "b":
-                self.open_tags.pop()
-                self.out.append("</b>")
-            if href:
-                self.out.append(f' (<a href="{escape(href, quote=True)}">{escape(href)}</a>)')
+            if "a" in self.open_tags:
+                # Close the most recent open anchor only.
+                self.open_tags.pop(len(self.open_tags) - 1 - self.open_tags[::-1].index("a"))
+                self.out.append("</a>")
             return
         if tag in {"code", "pre"} and tag in self.open_tags:
             self.open_tags.remove(tag)
@@ -256,13 +254,7 @@ class _InertPreviewSanitizer(HTMLParser):
                 self.out.append(f"</{closing}>")
 
     def handle_data(self, data: str) -> None:
-        text = data
-        if self._link_href is not None:
-            # Inside a link: text is already escaped by the parser; the href is
-            # appended after the closing tag, so keep text inert.
-            self.out.append(escape(unescape(text)))
-            return
-        self.out.append(escape(text))
+        self.out.append(escape(data))
 
     def result(self) -> str:
         while self.open_tags:
@@ -339,8 +331,14 @@ def _run_async(coroutine: Any) -> Any:
 
 
 def _media_preview_data_uri(data: Any) -> str | None:
-    """Return a bounded data URI only for common raster image formats."""
-    if not isinstance(data, bytes) or not data or len(data) > _MAX_MEDIA_PREVIEW_BYTES:
+    """Return a bounded data URI only for common raster image formats.
+
+    When the raw bytes already fit the budget they pass through untouched.
+    Oversized photos are re-encoded (downscaled to at most ~1600 px, JPEG at
+    a bounded quality) so the preview keeps real resolution instead of being
+    dropped. GIFs are never re-encoded to preserve animation.
+    """
+    if not isinstance(data, bytes) or not data:
         return None
     if data.startswith(b"\xff\xd8\xff"):
         media_type = "image/jpeg"
@@ -352,9 +350,65 @@ def _media_preview_data_uri(data: Any) -> str | None:
         media_type = "image/webp"
     else:
         return None
-    encoded = base64.b64encode(data).decode("ascii")
-    preview = f"data:{media_type};base64,{encoded}"
+    # Fast path: raw bytes already fit the budget.
+    if len(data) <= _MAX_MEDIA_PREVIEW_BYTES:
+        encoded = base64.b64encode(data).decode("ascii")
+        preview = f"data:{media_type};base64,{encoded}"
+        return preview if len(preview) <= _MAX_MEDIA_PREVIEW_DATA_URI_LENGTH else None
+    # Slow path: downscale + re-encode an oversized photo to fit the budget.
+    if media_type == "image/gif":
+        return None
+    reencoded = _reencode_preview(data)
+    if reencoded is None:
+        return None
+    out_type, out_bytes = reencoded
+    encoded = base64.b64encode(out_bytes).decode("ascii")
+    preview = f"data:{out_type};base64,{encoded}"
     return preview if len(preview) <= _MAX_MEDIA_PREVIEW_DATA_URI_LENGTH else None
+
+
+def _reencode_preview(data: bytes) -> tuple[str, bytes] | None:
+    """Downscale/re-encode an oversized raster to at most ~1600 px on a side.
+
+    Returns (media_type, bytes) or None. Lossy formats (JPEG/WebP) are
+    re-encoded as JPEG with bounded quality; animated/lossless content that
+    cannot be re-encoded cheaply returns None (the caller drops the preview).
+    """
+    try:
+        import io
+        from PIL import Image, ImageOps
+    except Exception:
+        return None
+    try:
+        image = Image.open(io.BytesIO(data))
+        image.load()
+    except Exception:
+        return None
+    try:
+        image = ImageOps.exif_transpose(image)
+        if image.mode in ("P", "PA"):
+            image = image.convert("RGBA")
+        if image.mode in ("RGB", "RGBA"):
+            width, height = image.size
+            longest = max(width, height)
+            if longest > 1600:
+                scale = 1600 / float(longest)
+                image = image.resize((max(1, int(width * scale)), max(1, int(height * scale))))
+            out = io.BytesIO()
+            if image.mode == "RGBA":
+                image = image.convert("RGB")
+            quality = 88
+            while quality >= 55:
+                out.seek(0)
+                out.truncate(0)
+                image.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
+                if out.tell() <= _MAX_MEDIA_PREVIEW_BYTES:
+                    return "image/jpeg", out.getvalue()
+                quality -= 12
+            return "image/jpeg", out.getvalue()
+    except Exception:
+        return None
+    return None
 
 
 def _message_has_image_media(message: Any) -> bool:
@@ -577,6 +631,7 @@ def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any]) -> tu
             "folderIds": folder_ids,
             "folderPins": folder_pins,
             "kind": entity.__class__.__name__ if entity is not None else "",
+            "webUsername": str(getattr(entity, "username", "") or "") if entity is not None else "",
             "isForum": bool(getattr(entity, "forum", False)),
             "topMessageId": int(getattr(getattr(dialog, "message", None), "id", 0) or 0),
             "lastMessageDate": dialog.date.isoformat() if getattr(dialog, "date", None) else "",
@@ -922,7 +977,11 @@ def messages(
             item = _public_message(message, own_id or 0)
             if preview_count < _MAX_MEDIA_PREVIEW_MESSAGES and _message_has_image_media(message):
                 try:
-                    raw_preview = await client.download_media(message, file=bytes, thumb=0)
+                    # -1 = the largest available photo size (native Telegram
+                    # uses this for full-size viewing); the old thumb=0
+                    # grabbed the smallest ~128 px thumbnail, so images were
+                    # blurry in the pane.
+                    raw_preview = await client.download_media(message, file=bytes, thumb=-1)
                 except Exception:
                     raw_preview = None
                 preview = _media_preview_data_uri(raw_preview)

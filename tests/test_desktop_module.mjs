@@ -93,6 +93,20 @@ function loadFunction(name, nextName, prefix = '') {
   return Function(`${prefix}\n${fn}\nreturn ${name}`)()
 }
 
+// buildMessageTmeLink calls buildTmeLink, so extract both together (with their
+// `export` keywords stripped) so the helper runs with its dependency in scope.
+const buildTmeLinkPair = source
+  .slice(source.indexOf('export function buildTmeLink('), source.indexOf('\nexport function consumeDialogsRequestPath('))
+  .replace('export function buildTmeLink', 'function buildTmeLink')
+  .replace('export function buildMessageTmeLink', 'function buildMessageTmeLink')
+const buildMessageTmeLinkImpl = new Function(`${buildTmeLinkPair}\nreturn buildMessageTmeLink`)()
+
+// mediaLabel depends on the MEDIA_LABELS const that precedes it; slice both.
+const mediaLabelImpl = new Function(
+  `${source.slice(source.indexOf('const MEDIA_LABELS ='), source.indexOf('\nexport function contextText('))
+    .replace('export function mediaLabel', 'function mediaLabel')}\nreturn mediaLabel`,
+)()
+
 const defaults = 'const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, unreadOnly: false, tab: \'all\' })\nconst settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`'
 
 function makeTelegramPane(dialogs, messages = []) {
@@ -131,7 +145,7 @@ function makeTelegramPane(dialogs, messages = []) {
   const Pane = new Function(
     'jsx', 'jsxs', 'useState', 'useRef', 'useEffect', 'useQueryClient', 'useQuery', 'useMutation',
     'loadSettings', 'settingsKey', 'filterDialogs', 'unreadBadge', 'renderMediaPreview', 'senderName', 'shortDate',
-    'action', 'note', 'stack', 'row', 'text', 'muted', 'buildTmeLink', 'buildMarkReadAction', 'consumeDialogsRequestPath',
+    'action', 'note', 'stack', 'row', 'text', 'muted', 'buildTmeLink', 'buildMessageTmeLink', 'mediaLabel', 'buildMarkReadAction', 'consumeDialogsRequestPath',
     'Button', 'Dialog', 'DialogContent', 'DialogHeader', 'DialogTitle', 'DialogDescription', 'DialogFooter',
     'Field', 'SafeHtml', 'Confirmation',
     `${paneSource}\nlet mountId = 0\nreturn TelegramPane`,
@@ -143,17 +157,22 @@ function makeTelegramPane(dialogs, messages = []) {
     loadFunction('senderName', 'shortDate'), loadFunction('shortDate', 'contextText'),
     (label, onClick, disabled = false, extra = {}) => jsx('button', { type: 'button', onClick, disabled, ...extra, children: label }),
     (message, isError = false) => jsx('div', { role: isError ? 'alert' : 'note', children: message }),
-    {}, {}, {}, {}, () => null, loadFunction('buildMarkReadAction', 'TEXT_LIMIT'), () => '/dialogs?limit=40&refresh=0',
+    {}, {}, {}, {}, () => null,
+    buildMessageTmeLinkImpl, mediaLabelImpl,
+    loadFunction('buildMarkReadAction', 'TEXT_LIMIT'), () => '/dialogs?limit=40&refresh=0',
     'button', 'Dialog', 'DialogContent', 'DialogHeader', 'DialogTitle', 'DialogDescription', 'DialogFooter',
     'Field', 'SafeHtml', 'Confirmation',
   )
   const render = () => {
     slot = 0
-    return Pane({
-      ctx: { storage: { get: () => null, set() {} }, os: { openExternal() {} }, rest },
+    const opened = []
+    const pane = Pane({
+      ctx: { storage: { get: () => null, set() {} }, os: { openExternal: url => { opened.push(url) } }, rest },
       identity: { scope: testScope, me: 'Me' }, profile: 'default', queryPrefix: ['test'],
       statusUnavailable: false, retryButton: null,
     })
+    pane.opened = opened
+    return pane
   }
   render.restCalls = () => restCalls
   return render
@@ -289,7 +308,9 @@ test('safe Telegram image previews render as bounded lazy images', () => {
   assert.equal(image.props.loading, 'lazy')
   assert.match(image.props.alt, /7/)
   assert.equal(render({ mediaPreview: 'data:image/svg+xml;base64,PHN2Zz4=' }), null)
-  assert.equal(render({ mediaPreview: `data:image/png;base64,${'A'.repeat(88000)}` }), null)
+  // data URI bound is 240_000 chars INCLUDING the 'data:image/png;base64,' prefix (22 chars)
+  assert.equal(render({ mediaPreview: `data:image/png;base64,${'A'.repeat(239979)}` }), null)
+  assert.equal(render({ mediaPreview: `data:image/png;base64,${'A'.repeat(239978)}` })?.type, 'img')
 })
 
 test('unmuted switch changes and restores the rendered dialog rows in the same folder', () => {
@@ -386,6 +407,48 @@ test('peer helpers produce safe links', () => {
   assert.equal(link('id:123'), null)
   assert.equal(link('javascript:alert(1)'), null)
   assert.equal(link(''), null)
+})
+
+test('buildMessageTmeLink points at a specific message', () => {
+  assert.equal(buildMessageTmeLinkImpl('@username', 501, ''), 'https://t.me/username/501')
+  // Public channel: the dialog's webUsername (no @) is the deep link target.
+  assert.equal(buildMessageTmeLinkImpl('id:5', 9, 'channel'), 'https://t.me/channel/9')
+  // Private supergroup (no username): t.me/c/<positive_id>/<message_id>.
+  assert.equal(buildMessageTmeLinkImpl('id:-1001234567890', 77, ''), 'https://t.me/c/1234567890/77')
+  // Bare numeric peer id: plain t.me/<peer_id>/<message_id> form.
+  assert.equal(buildMessageTmeLinkImpl('id:123', 4, ''), 'https://t.me/123/4')
+  // No usable message id falls back to the chat link.
+  assert.equal(buildMessageTmeLinkImpl('@username', 0, ''), 'https://t.me/username')
+  assert.equal(buildMessageTmeLinkImpl('', 10, ''), null)
+})
+
+test('mediaLabel maps raw Telethon media classes to friendly names', () => {
+  assert.equal(mediaLabelImpl('MessageMediaPhoto'), 'photo')
+  assert.equal(mediaLabelImpl('MessageMediaDocument'), 'file')
+  assert.equal(mediaLabelImpl('MessageMediaVideo'), 'video')
+  assert.equal(mediaLabelImpl('MessageMediaVoice'), 'voice')
+  // Unknown classes pass through rather than being hidden, so a real
+  // Telethon media type is never silently turned into a wrong label.
+  assert.equal(mediaLabelImpl('MessageMediaUnsupported'), 'MessageMediaUnsupported')
+  assert.equal(mediaLabelImpl(''), '')
+  assert.equal(mediaLabelImpl(undefined), '')
+})
+
+test('per-post Open in browser button deep-links the exact message', async () => {
+  const render = makeTelegramPane([
+    { key: '@alice', name: 'Alice', muted: false, unread: 0, topMessageId: 42, folderIds: ['all'] },
+  ], [{ id: 15, date: '2026-10-07T10:00:00Z', mine: false, sender: 'Bob', htmlPreview: 'hello', media: '', replyTo: null }])
+  const treeNodes = tree => Array.isArray(tree) ? tree.flatMap(treeNodes)
+    : tree && typeof tree === 'object' ? [tree, ...treeNodes(tree.props?.children)] : []
+  let tree = render()
+  treeNodes(tree).find(node => node.type === 'button' && Array.isArray(node.props.children)
+    && node.props.children[0]?.props?.children === 'Alice').props.onClick()
+  tree = render()
+  const open = treeNodes(tree).find(node => node.type === 'button' && node.props.children === 'Open post in browser')
+  assert.ok(open, 'per-post Open post in browser button is rendered')
+  await open.props.onClick()
+  assert.deepEqual(tree.opened, ['https://t.me/alice/15'])
+  assert.match(source, /os\.openExternal/)
 })
 
 test('sender and date helpers degrade gracefully', () => {

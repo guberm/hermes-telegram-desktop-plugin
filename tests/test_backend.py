@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import asyncio
 import json
+import random
 import sys
 import tempfile
 import time
@@ -66,12 +67,27 @@ class SanitizerTests(unittest.TestCase):
         self.assertIn("<b>bold</b>", rendered)
         self.assertNotIn("script", rendered)
 
-    def test_link_href_is_https_only_and_appended(self):
+    def test_link_is_rendered_once_and_clickable(self):
+        # The link text must appear exactly once; no bold wrap and no
+        # parenthesized duplicate of the URL (the old behavior printed the
+        # href a second time, so a bare-URL link showed the URL 3x).
         rendered = MODULE.sanitize_message_html('<a href="https://example.com/x">click</a>')
-        self.assertIn('href="https://example.com/x"', rendered)
-        self.assertIn("click", rendered)
-        evil = MODULE.sanitize_message_html('<a href="javascript:alert(1)">x</a>')
-        self.assertNotIn("javascript:", evil)
+        self.assertEqual(rendered, '<a href="https://example.com/x">click</a>')
+        self.assertEqual(rendered.count("click"), 1)
+        self.assertNotIn("(", rendered)
+        self.assertNotIn("<b>", rendered)
+
+    def test_bare_url_link_is_not_duplicated(self):
+        # When the link text is the URL itself, the output is exactly the
+        # anchor with the URL as its text — no bolded copy, no appended
+        # parenthesized copy. The old code printed the URL three times.
+        url = "https://telegram.org/blog/1-11"
+        rendered = MODULE.sanitize_message_html(f'<a href="{url}">{url}</a>')
+        self.assertEqual(rendered, f'<a href="{url}">{url}</a>')
+
+    def test_link_href_is_https_only(self):
+        self.assertNotIn("javascript:", MODULE.sanitize_message_html('<a href="javascript:alert(1)">x</a>'))
+        self.assertNotIn("href", MODULE.sanitize_message_html('<a href="file:///etc/passwd">x</a>'))
 
     def test_output_is_bounded(self):
         rendered = MODULE.sanitize_message_html("x" * 20000)
@@ -478,7 +494,7 @@ class PublicMessageTests(unittest.TestCase):
 
             async def download_media(self, target, file, *, thumb):
                 self_thumb = thumb
-                assert target is message and file is bytes and self_thumb == 0
+                assert target is message and file is bytes and self_thumb == -1
                 return image_bytes
 
         client = Client()
@@ -498,6 +514,77 @@ class PublicMessageTests(unittest.TestCase):
 
         preview = result["messages"][0]["mediaPreview"]
         self.assertTrue(preview.startswith("data:image/png;base64,"))
+        self.assertLessEqual(len(preview), MODULE._MAX_MEDIA_PREVIEW_DATA_URI_LENGTH)
+
+    def test_oversized_photo_is_reencoded_to_fit_budget(self):
+        # A large full-size photo (thumb=-1) exceeds the raw byte budget; it
+        # must be downscaled/re-encoded rather than dropped, so the pane keeps
+        # a real-resolution image instead of the old blurry 128px thumbnail.
+        # We synthesize a complex 2400x1600 photo (crisp shapes that compress
+        # like a real picture) whose raw JPEG is >160KB but downscales back
+        # under budget at quality 88.
+        from PIL import Image, ImageDraw
+        import io
+
+        def shapes(w, h, n, seed):
+            img = Image.new("RGB", (w, h), (210, 180, 140))
+            d = ImageDraw.Draw(img)
+            rnd = random.Random(seed)
+            for _ in range(n):
+                x0 = rnd.randrange(0, w)
+                y0 = rnd.randrange(0, h)
+                r = rnd.randrange(20, min(w, h) // 6)
+                d.ellipse([x0 - r, y0 - r, x0 + r, y0 + r],
+                          fill=(rnd.randrange(60, 220), rnd.randrange(60, 220), rnd.randrange(60, 220)),
+                          outline=(30, 30, 30), width=2)
+                d.line([x0, y0, x0 + r, y0 - r], fill=(20, 20, 20), width=3)
+            return img
+
+        img = shapes(2400, 1600, 60, seed=7)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=92, optimize=True)
+        big_jpeg = buf.getvalue()
+        self.assertGreater(len(big_jpeg), MODULE._MAX_MEDIA_PREVIEW_BYTES)
+
+        message = make_message(101)
+        message.media = SimpleNamespace()
+        message.photo = SimpleNamespace()
+        message.document = None
+
+        class Client:
+            async def get_entity(self, peer):
+                return SimpleNamespace(id=-100123, title="Test Group")
+
+            async def get_me(self):
+                return SimpleNamespace(id=1)
+
+            async def get_dialogs(self, limit=None):
+                return []
+
+            async def iter_messages(self, entity, **kwargs):
+                yield message
+
+            async def download_media(self, target, file, *, thumb):
+                assert thumb == -1
+                return big_jpeg
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.messages(
+                SimpleNamespace(query_params={}), scope="test-scope", peer="@testgroup", limit=1, topicId=0,
+            )
+
+        preview = result["messages"][0]["mediaPreview"]
+        self.assertTrue(preview.startswith("data:image/jpeg;base64,"))
         self.assertLessEqual(len(preview), MODULE._MAX_MEDIA_PREVIEW_DATA_URI_LENGTH)
 
     def test_unrecognized_image_preview_is_not_returned(self):
@@ -876,6 +963,8 @@ class ForcedRefreshRouteTests(unittest.TestCase):
             )
         self.assertEqual(result["activeFolder"], "all")
         self.assertEqual([row["name"] for row in result["dialogs"]], ["Test Group"])
+        # Entity username is surfaced so the UI can build per-post t.me links.
+        self.assertEqual(result["dialogs"][0]["webUsername"], "group")
         self.assertEqual(client.limit, MODULE._DIALOG_SNAPSHOT_LIMIT)
         self.assertEqual(type(client.request).__name__, "GetDialogFiltersRequest")
 
