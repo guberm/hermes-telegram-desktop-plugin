@@ -213,11 +213,12 @@ test('unread badge uses the verified Desktop contrast tokens and readable counts
   assert.equal(hotStyle.border, undefined)
   const mutedPill = badge(7865, true)
   assert.match(mutedPill.props.style.border, /1px solid/)
-  assert.equal(mutedPill.props.children, '99+') // 7865 -> 99+
+  // Exact count: large unread values are shown in full, never collapsed to 99+.
+  assert.equal(mutedPill.props.children, '7865')
   const small = badge(3, true)
   assert.equal(small.props.children, '3')
   assert.equal(badge(1, false).props.children, '1')
-  assert.equal(badge(100, false).props.children, '99+')
+  assert.equal(badge(100, false).props.children, '100')
 })
 
 test('folder tabs remain horizontally scrollable in a constrained narrow header', () => {
@@ -292,6 +293,8 @@ test('mark-read actions preserve the selected post and forum topic ID', () => {
   assert.ok(/Mark whole forum read/.test(source), 'whole-forum action is explicit')
   assert.ok(/action\('Mark read up to here', \(\) => \{ void requestMarkRead\(message\.id, topicId\) \}/.test(source), 'message action preserves its selected ID')
   assert.ok(/requestMarkRead\(activeDialog\.topMessageId, 0\)/.test(source), 'chat action uses the visible chat ceiling')
+  assert.ok(/'Mark topic as read',/.test(source), 'in-topic action targets the current topic')
+  assert.ok(/requestMarkRead\(activeTopic\.topMessage, topicId\)/.test(source), 'topic action uses the topic ceiling')
 })
 
 test('forum topics are fetched by stable ID and selected before their messages are loaded', () => {

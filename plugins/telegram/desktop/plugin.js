@@ -532,7 +532,7 @@ export function unreadBadge(unread, muted) {
           borderRadius: '999px', fontSize: '0.72rem', fontWeight: 700,
           padding: '0.06rem 0.5rem', flexShrink: 0, fontVariantNumeric: 'tabular-nums',
         },
-    children: String(unread > 99 ? '99+' : unread),
+    children: String(unread),
   })
 }
 
@@ -857,11 +857,18 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             jsxs('div', { style: row, children: [
               buildTmeLink(dialogKey) && action('Open in browser', () => { void ctx.os.openExternal(buildTmeLink(dialogKey)) }, false),
               topicId > 0 && activeDialog?.isForum ? action('Back to topics', () => setTopicId(0), waiting) : null,
-              activeDialog?.unread > 0 && activeDialog?.topMessageId > 0 && action(
-                activeDialog.isForum ? 'Mark whole forum read' : 'Mark chat as read',
-                () => { void requestMarkRead(activeDialog.topMessageId, 0) }, waiting,
-                { title: 'Review and confirm the exact latest message before changing read state' },
-              ),
+              topicId > 0 && activeTopic
+                ? activeTopic.unread > 0 && action(
+                  'Mark topic as read',
+                  () => { void requestMarkRead(activeTopic.topMessage, topicId) },
+                  waiting,
+                  { title: 'Review and confirm the exact latest topic post before changing read state' },
+                )
+                : activeDialog?.unread > 0 && activeDialog?.topMessageId > 0 && action(
+                  activeDialog.isForum ? 'Mark whole forum read' : 'Mark chat as read',
+                  () => { void requestMarkRead(activeDialog.topMessageId, 0) }, waiting,
+                  { title: 'Review and confirm the exact latest message before changing read state' },
+                ),
               !activeDialog?.isForum && action('Reply here', () => beginCompose(dialogKey), waiting)
             ] })
           ] }),
