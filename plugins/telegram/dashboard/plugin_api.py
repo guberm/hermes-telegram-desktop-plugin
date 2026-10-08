@@ -912,16 +912,35 @@ def dialogs(
             # not the raw message total). Only real forums pay this cost — a
             # non-forum megagroup would make the scan pointless.
             unread_topics: dict[str, int] = {}
+            forum_count = 0
             for dialog in result:
                 entity = getattr(dialog, "entity", None)
-                if entity is None or not getattr(entity, "forum", False):
+                if entity is None:
                     continue
+                is_forum = getattr(entity, "forum", False)
+                if not is_forum:
+                    continue
+                forum_count += 1
+                print(
+                    f"[FORUM_SCAN] dialog_key={_peer_key(entity)} entity_id={entity.id} title={getattr(entity, 'title', '?')}",
+                    file=sys.stderr,
+                )
                 try:
-                    unread_topics[_peer_key(entity)] = await _unread_topics_count(client, entity)
-                except Exception:
-                    # A topic scan must never break the whole dialogs list; fall
-                    # back to the raw unread count (badge still shows something).
-                    pass
+                    topic_count = await _unread_topics_count(client, entity)
+                    unread_topics[_peer_key(entity)] = topic_count
+                    print(
+                        f"[FORUM_SCAN] ok topic_count={topic_count} for {_peer_key(entity)}",
+                        file=sys.stderr,
+                    )
+                except Exception as e:
+                    print(
+                        f"[FORUM_SCAN] error {e} for {_peer_key(entity)} — falling back to raw unread",
+                        file=sys.stderr,
+                    )
+            print(
+                f"[FORUM_SCAN] total_forum_dialogs={forum_count} built_unread_topics_keys={len(unread_topics)}",
+                file=sys.stderr,
+            )
             response = await client(functions.messages.GetDialogFiltersRequest())
             telegram_filters = [
                 definition for definition in (getattr(response, "filters", None) or [])
