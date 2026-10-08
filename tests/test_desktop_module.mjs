@@ -497,6 +497,27 @@ test('per-post Open in browser button deep-links the exact message', async () =>
   assert.match(source, /os\.openExternal/)
 })
 
+test('message-history action bar is sticky while the history scrolls', () => {
+  const render = makeTelegramPane([
+    { key: '@alice', name: 'Alice', muted: false, unread: 2, topMessageId: 42, folderIds: ['all'] },
+  ], [{ id: 15, date: '2026-10-07T10:00:00Z', mine: false, sender: 'Bob', htmlPreview: 'hello', media: '', replyTo: null }])
+  const treeNodes = tree => Array.isArray(tree) ? tree.flatMap(treeNodes)
+    : tree && typeof tree === 'object' ? [tree, ...treeNodes(tree.props?.children)] : []
+  let tree = render()
+  treeNodes(tree).find(node => node.type === 'button' && Array.isArray(node.props.children)
+    && node.props.children[0]?.props?.children === 'Alice').props.onClick()
+  tree = render()
+  // The bar holding 'Open in browser' / 'Mark chat as read' / 'Reply here'
+  // is the sticky header div itself.
+  const bar = treeNodes(tree).find(node => node.type === 'div' && node.props?.style?.position === 'sticky'
+    && treeNodes(node.props.children).some(child => child?.props?.children === 'Reply here'))
+  assert.ok(bar, 'action bar is rendered')
+  assert.equal(bar.props.style.position, 'sticky', 'action bar sticks to the top of the scroll container')
+  assert.equal(bar.props.style.zIndex, 2, 'action bar renders above the messages')
+  assert.match(String(bar.props.style.background), /var\(--ui-card/)
+  assert.match(source, /position: 'sticky', top: '-0\.5rem', zIndex: 2/)
+})
+
 test('sender and date helpers degrade gracefully', () => {
   const nameOf = loadFunction('senderName', 'shortDate')
   const dateOf = loadFunction('shortDate', 'contextText')

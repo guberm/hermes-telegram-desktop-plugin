@@ -841,7 +841,16 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
         }),
         jsxs('div', { 'aria-label': 'Message history', style: { ...stack, overflow: 'auto', maxHeight: '70vh', border: '1px solid var(--ui-stroke-secondary)', borderRadius: '0.4rem', padding: '0.5rem' }, children: [
           !dialogKey && note('Select a dialog to read its recent messages.'),
-          dialogKey && jsxs('div', { style: { ...row, justifyContent: 'space-between' }, children: [
+          dialogKey && jsxs('div', { style: {
+            ...row, justifyContent: 'space-between', flexWrap: 'wrap',
+            // Sticky: the action buttons stay visible while the message
+            // history scrolls under them; opaque background hides posts
+            // passing beneath the bar.
+            position: 'sticky', top: '-0.5rem', zIndex: 2,
+            background: 'var(--ui-card, var(--ui-bg-primary))',
+            margin: '-0.5rem -0.5rem 0', padding: '0.5rem',
+            borderBottom: '1px solid var(--ui-stroke-secondary)',
+          }, children: [
             jsx('strong', { children: activeTopic
               ? `${activeDialog?.name || dialogKey} · ${activeTopic.title}`
               : activeDialog?.name || dialogKey }),
