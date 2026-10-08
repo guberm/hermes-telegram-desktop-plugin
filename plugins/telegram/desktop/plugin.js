@@ -852,7 +852,9 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             // history scrolls under them; opaque background hides posts
             // passing beneath the bar.
             position: 'sticky', top: '-0.5rem', zIndex: 2,
-            background: 'var(--ui-card, var(--ui-bg-primary))',
+            // Solid surface: --ui-bg-primary is a translucent overlay tint;
+            // --ui-bg-editor is the opaque pane background (theme-aware).
+            background: 'var(--ui-bg-editor, var(--ui-bg-primary))',
             margin: '-0.5rem -0.5rem 0', padding: '0.5rem',
             borderBottom: '1px solid var(--ui-stroke-secondary)',
           }, children: [
@@ -972,7 +974,7 @@ function Connected({ ctx, profile }) {
   // The dedicated session exists but is not logged in yet: /status answers 503
   // "not authorized". Show the standalone login panel; hide it once authorized.
   const needsLogin = status.isError && /authoriz/i.test(String(status.error?.message || '') + String(status.error?.body || ''))
-  return jsxs('main', { style: { ...stack, height: '100%', overflow: 'auto', padding: '1rem', color: 'var(--ui-text-primary)', background: 'var(--ui-bg-primary, var(--ui-card))' }, children: [
+  return jsxs('main', { style: { ...stack, height: '100%', overflow: 'auto', padding: '1rem', color: 'var(--ui-text-primary)', background: 'var(--ui-bg-editor, var(--ui-bg-primary))' }, children: [
     jsx('h1', { children: 'Telegram' }),
     note('Read dialogs and history as reference. Every send, reply, delete, or mark-read requires review and backend confirmation.'),
     status.isPending && note('Connecting to the current Telegram backend…'),
