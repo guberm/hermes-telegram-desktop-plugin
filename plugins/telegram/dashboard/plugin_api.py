@@ -92,7 +92,13 @@ _mount_auth_router()
 
 _TELETHON_TIMEOUT_SECONDS = 20.0
 _DIALOG_SNAPSHOT_LIMIT = 500
-_DIALOG_CACHE_TTL_SECONDS = 20.0
+# Snapshot cache: manual refresh bypasses it (refresh=1), but folder/tab
+# switches and auto-refresh polls (30/60 s) reuse it. A 60 s TTL covers a full
+# 30 s poll cycle (and most of the 60 s one), so the poll never pays the
+# full Telegram RTT cost of a fresh dialog snapshot — only a forced refresh
+# does. ponytail: stale-unread up to 60 s off-manual-refresh; add per-folder
+# TTLs if stale badges start to matter.
+_DIALOG_CACHE_TTL_SECONDS = 60.0
 _TICKET_TTL_SECONDS = 300.0
 _MAX_TICKETS = 256
 _MAX_SCOPES = 128
@@ -106,6 +112,37 @@ _FORUM_TOPIC_SCAN_MAX = 1000
 # base64 data URI bound keeps the JSON payload bounded at ~220 KB.
 _MAX_MEDIA_PREVIEW_BYTES = 160 * 1024
 _MAX_MEDIA_PREVIEW_DATA_URI_LENGTH = 240_000
+# Media previews are cached per (backend, scope, message id): a refresh cycle
+# re-downloads only images the backend has never fetched before. TTL is
+# generous — photos don't change — and 64 entries bounds the cache at ~15 MB
+# (each entry is at most _MAX_MEDIA_PREVIEW_DATA_URI_LENGTH).
+_MEDIA_PREVIEW_CACHE_TTL_SECONDS = 300.0
+_MEDIA_PREVIEW_CACHE_MAX = 64
+_media_previews: "OrderedDict[tuple[str, str, int], tuple[float, str]]" = OrderedDict()
+_media_preview_cache_lock = threading.Lock()
+
+
+def _media_preview_get(scope: str, message_id: int) -> str | None:
+    key = (_BACKEND_INSTANCE, scope, message_id)
+    now = _now()
+    with _media_preview_cache_lock:
+        entry = _media_previews.get(key)
+        if entry is None:
+            return None
+        if now - entry[0] > _MEDIA_PREVIEW_CACHE_TTL_SECONDS:
+            _media_previews.pop(key, None)
+            return None
+        _media_previews.move_to_end(key)
+        return entry[1]
+
+
+def _media_preview_put(scope: str, message_id: int, data_uri: str) -> None:
+    key = (_BACKEND_INSTANCE, scope, message_id)
+    with _media_preview_cache_lock:
+        _media_previews[key] = (_now(), data_uri)
+        _media_previews.move_to_end(key)
+        while len(_media_previews) > _MEDIA_PREVIEW_CACHE_MAX:
+            _media_previews.popitem(last=False)
 _TOPIC_ROOT_RE = re.compile(r"^https?://t\.me/c/(\d+)/(?:\d+/)?(\d+)")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,256}$")
 _BACKEND_INSTANCE = secrets.token_urlsafe(24)
@@ -1012,18 +1049,26 @@ def messages(
                 continue
             item = _public_message(message, own_id or 0)
             if preview_count < _MAX_MEDIA_PREVIEW_MESSAGES and _message_has_image_media(message):
-                try:
-                    # -1 = the largest available photo size (native Telegram
-                    # uses this for full-size viewing); the old thumb=0
-                    # grabbed the smallest ~128 px thumbnail, so images were
-                    # blurry in the pane.
-                    raw_preview = await client.download_media(message, file=bytes, thumb=-1)
-                except Exception:
-                    raw_preview = None
-                preview = _media_preview_data_uri(raw_preview)
-                if preview:
-                    item["mediaPreview"] = preview
+                message_id = item.get("id")
+                cached_preview = _media_preview_get(scope, message_id) if isinstance(message_id, int) else None
+                if cached_preview is not None:
+                    item["mediaPreview"] = cached_preview
                     preview_count += 1
+                else:
+                    try:
+                        # -1 = the largest available photo size (native Telegram
+                        # uses this for full-size viewing); the old thumb=0
+                        # grabbed the smallest ~128 px thumbnail, so images were
+                        # blurry in the pane.
+                        raw_preview = await client.download_media(message, file=bytes, thumb=-1)
+                    except Exception:
+                        raw_preview = None
+                    preview = _media_preview_data_uri(raw_preview)
+                    if preview:
+                        item["mediaPreview"] = preview
+                        preview_count += 1
+                        if isinstance(message_id, int):
+                            _media_preview_put(scope, message_id, preview)
             found.append(item)
             if len(found) >= limit:
                 break

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from base64 import b64decode
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -469,6 +470,7 @@ class PublicMessageTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in result["messages"]], [5, 7])
 
     def test_messages_include_bounded_raster_photo_previews(self):
+        MODULE._media_previews.clear()
         from base64 import b64decode
 
         image_bytes = b64decode(
@@ -516,6 +518,76 @@ class PublicMessageTests(unittest.TestCase):
         self.assertTrue(preview.startswith("data:image/png;base64,"))
         self.assertLessEqual(len(preview), MODULE._MAX_MEDIA_PREVIEW_DATA_URI_LENGTH)
 
+    def test_media_preview_cache_avoids_re_downloading_on_refresh(self):
+        # A refresh poll must not re-download images the backend already
+        # fetched: the second /messages call serves the cached data URI and
+        # performs no download at all.
+        MODULE._media_previews.clear()
+        image_bytes = b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jE0cAAAAASUVORK5CYII="
+        )
+        message = make_message(101)
+        message.media = SimpleNamespace()
+        message.photo = SimpleNamespace()
+        message.document = None
+
+        class Client:
+            downloads = 0
+
+            async def get_entity(self, peer):
+                return SimpleNamespace(id=-100123, title="Test Group")
+
+            async def get_me(self):
+                return SimpleNamespace(id=1)
+
+            async def get_dialogs(self, limit=None):
+                return []
+
+            async def iter_messages(self, entity, **kwargs):
+                yield message
+
+            async def download_media(self, target, file, *, thumb):
+                type(self).downloads += 1
+                return image_bytes
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        patches = (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        )
+        for p in patches:
+            p.start()
+        try:
+            for _ in range(2):
+                result = MODULE.messages(
+                    SimpleNamespace(query_params={}), scope="cache-scope", peer="@testgroup", limit=1, topicId=0,
+                )
+                self.assertTrue(result["messages"][0]["mediaPreview"].startswith("data:image/png;base64,"))
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(client.downloads, 1, "second refresh must not re-download")
+
+    def test_media_preview_cache_ttl_and_lru_bound(self):
+        MODULE._media_previews.clear()
+        uri = "data:image/png;base64,AA"
+        # LRU: entries beyond the cap are evicted oldest-first.
+        for i in range(MODULE._MEDIA_PREVIEW_CACHE_MAX + 2):
+            MODULE._media_preview_put("scope", i, uri)
+        self.assertIsNone(MODULE._media_preview_get("scope", 0))
+        self.assertEqual(MODULE._media_preview_get("scope", MODULE._MEDIA_PREVIEW_CACHE_MAX + 1), uri)
+        # TTL: a stale entry is treated as a miss.
+        MODULE._media_previews.clear()
+        MODULE._media_preview_put("scope", 1, uri)
+        with patch.object(MODULE, "_now", return_value=time.time() + MODULE._MEDIA_PREVIEW_CACHE_TTL_SECONDS + 1):
+            self.assertIsNone(MODULE._media_preview_get("scope", 1))
+
     def test_oversized_photo_is_reencoded_to_fit_budget(self):
         # A large full-size photo (thumb=-1) exceeds the raw byte budget; it
         # must be downscaled/re-encoded rather than dropped, so the pane keeps
@@ -523,6 +595,7 @@ class PublicMessageTests(unittest.TestCase):
         # We synthesize a complex 2400x1600 photo (crisp shapes that compress
         # like a real picture) whose raw JPEG is >160KB but downscales back
         # under budget at quality 88.
+        MODULE._media_previews.clear()
         from PIL import Image, ImageDraw
         import io
 
@@ -588,6 +661,7 @@ class PublicMessageTests(unittest.TestCase):
         self.assertLessEqual(len(preview), MODULE._MAX_MEDIA_PREVIEW_DATA_URI_LENGTH)
 
     def test_unrecognized_image_preview_is_not_returned(self):
+        MODULE._media_previews.clear()
         message = make_message(101)
         message.media = SimpleNamespace()
         message.photo = SimpleNamespace()
