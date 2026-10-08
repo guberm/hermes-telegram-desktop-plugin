@@ -13,6 +13,7 @@ import asyncio
 import base64
 import importlib.util
 import json
+import logging
 import re
 import secrets
 import sys
@@ -30,6 +31,21 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 router = APIRouter()
+
+# Structured, no-secrets debug log. The Hermes agent captures stderr, so this
+# is the single place to see what the backend actually did on each mutation —
+# peer, message id, commit/verify outcomes, timings, and the exact exception
+# that gets wrapped into a 502. Log at DEBUG; the handler is attached once at
+# import time (idempotent) so it does not depend on host log config.
+logger = logging.getLogger("hermes.telegram_desktop")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S",
+    ))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
 
 # One shared TelegramClient per dedicated profile session; each instance is
 # serialized by its own owner loop and guarded by the on-disk process lock.
@@ -677,6 +693,13 @@ def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any], unrea
                 folder_ids.append(ident)
                 if pinned:
                     folder_pins.append(ident)
+        is_forum = bool(getattr(entity, "forum", False))
+        unread_topics_value = int(unread_topics.get(dialog_key, 0) or 0)
+        logger.info(
+            "dialog row key=%s name=%s unread=%d unreadTopics=%d isForum=%s topMessageId=%s",
+            dialog_key, _peer_display_name(entity), unread, unread_topics_value,
+            is_forum, int(getattr(getattr(dialog, "message", None), "id", 0) or 0),
+        )
         rows.append({
             "key": dialog_key,
             "name": _peer_display_name(entity),
@@ -684,14 +707,14 @@ def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any], unrea
             # For a forum the badge should show the number of topics that have
             # new messages, not the raw message total; for a plain dialog it is
             # absent and the UI falls back to the message count.
-            "unreadTopics": int(unread_topics.get(dialog_key, 0) or 0),
+            "unreadTopics": unread_topics_value,
             "muted": _dialog_is_muted(dialog),
             "folder": int(raw_folder) if raw_folder is not None else 0,
             "folderIds": folder_ids,
             "folderPins": folder_pins,
             "kind": entity.__class__.__name__ if entity is not None else "",
             "webUsername": str(getattr(entity, "username", "") or "") if entity is not None else "",
-            "isForum": bool(getattr(entity, "forum", False)),
+            "isForum": is_forum,
             "topMessageId": int(getattr(getattr(dialog, "message", None), "id", 0) or 0),
             "lastMessageDate": dialog.date.isoformat() if getattr(dialog, "date", None) else "",
         })
@@ -921,25 +944,19 @@ def dialogs(
                 if not is_forum:
                     continue
                 forum_count += 1
-                print(
-                    f"[FORUM_SCAN] dialog_key={_peer_key(entity)} entity_id={entity.id} title={getattr(entity, 'title', '?')}",
-                    file=sys.stderr,
+                logger.info(
+                    "forum scan key=%s entityId=%s title=%s",
+                    _peer_key(entity), entity.id, getattr(entity, "title", "?"),
                 )
                 try:
                     topic_count = await _unread_topics_count(client, entity)
                     unread_topics[_peer_key(entity)] = topic_count
-                    print(
-                        f"[FORUM_SCAN] ok topic_count={topic_count} for {_peer_key(entity)}",
-                        file=sys.stderr,
-                    )
-                except Exception as e:
-                    print(
-                        f"[FORUM_SCAN] error {e} for {_peer_key(entity)} — falling back to raw unread",
-                        file=sys.stderr,
-                    )
-            print(
-                f"[FORUM_SCAN] total_forum_dialogs={forum_count} built_unread_topics_keys={len(unread_topics)}",
-                file=sys.stderr,
+                    logger.info("forum scan ok topicsWithUnread=%s key=%s", topic_count, _peer_key(entity))
+                except Exception:
+                    logger.exception("forum scan failed key=%s (falling back to raw unread)", _peer_key(entity))
+            logger.info(
+                "forum scan summary forumDialogs=%d keysBuilt=%d snapshotSize=%d refresh=%s",
+                forum_count, len(unread_topics), len(result), refresh,
             )
             response = await client(functions.messages.GetDialogFiltersRequest())
             telegram_filters = [
@@ -1408,30 +1425,22 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
                 ))
             else:
                 await client.send_read_acknowledge(entity, max_id=payload["maxId"])
+            logger.info(
+                "mark-read committed peer=%s maxId=%s topicId=%s",
+                name, payload["maxId"], topic_id,
+            )
             return {"peer": name, "maxId": payload["maxId"]}
         if action == "save":
-            # DEBUG: forward with from_peer — ensures Telethon does not raise
-            # ValueError('from_peer must be given if integer IDs are used').
-            # Before this fix the call lacked from_peer and every save failed
-            # with a wrapped provider error. Log entry/exit so operators can
-            # confirm the path is exercised without breaking the JSON payload.
-            print(
-                f"[SAVE] from_peer=entity; messageId={payload['messageId']} "
-                f"peer={payload['peer']}",
-                file=sys.stderr,
-            )
-            target = await client.get_messages(entity, ids=payload["messageId"])
-            if target is None:
-                raise _peer_ref_error("Message to save no longer exists.")
             # from_peer is required when forwarding by integer IDs: it tells
             # Telethon which chat the message belongs to. Without it, the
             # client raises ValueError before the RPC is sent.
+            logger.info("save commit peer=%s messageId=%s", name, payload["messageId"])
+            target = await client.get_messages(entity, ids=payload["messageId"])
+            if target is None:
+                raise _peer_ref_error("Message to save no longer exists.")
             forwarded = await client.forward_messages("me", [payload["messageId"]], from_peer=entity)
             sent = forwarded[0] if isinstance(forwarded, list) else forwarded
-            print(
-                f"[SAVE] forwarded id={sent.id} peer_name={name}",
-                file=sys.stderr,
-            )
+            logger.info("save commit ok sentId=%s peer=%s", sent.id, name)
             return {"sentId": int(sent.id), "peer": name}
         target = await client.get_messages(entity, ids=payload["messageId"])
         if target is None:
@@ -1446,6 +1455,7 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception:
+        logger.exception("commit failed action=%s peer=%s", payload.get("action"), payload.get("peer"))
         raise _provider_error(mutation_started=True) from None
 
     # Read back the exact resulting state; the RPC return is not proof.
@@ -1479,6 +1489,10 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
                 after_dialog = next((d for d in fresh if _dialog_match(d, entity)), None)
                 unread_after = int(getattr(after_dialog, "unread_count", 0) or 0) if after_dialog is not None else 0
                 cursor = _dialog_read_cursor(after_dialog) if after_dialog is not None else 0
+            logger.info(
+                "mark-read readback peer=%s maxId=%s cursor=%s unreadAfter=%s",
+                name, max_id, cursor, unread_after,
+            )
             # A bounded read must advance the exact chat/topic cursor through
             # the requested post; newer posts may remain unread.
             if cursor < max_id:
@@ -1501,7 +1515,9 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
     try:
         result = _run_async(_with_client(_verify))
     except Exception:
+        logger.exception("verify failed action=%s peer=%s", action, payload.get("peer"))
         raise _provider_error(mutation_started=True) from None
+    logger.info("mutated action=%s peer=%s result=%s", action, payload.get("peer"), result)
     if action == "mark-read":
         _DIALOG_CACHE.pop(body.scope, None)
     return result

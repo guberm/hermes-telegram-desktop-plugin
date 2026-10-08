@@ -840,16 +840,30 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             },
             children: [
               jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: dialog.unread > 0 && !dialog.muted ? 700 : 400 }, children: `${dialog.muted ? '🔇 ' : ''}${dialog.name || dialog.key}` }),
-              // Badge semantics: with a specific topic open, show that topic's
-              // unread message count; in a forum's overview, show the number of
-              // topics that have unread messages; for a plain dialog, the
-              // unread message count. The raw count stays as a fallback so a
-              // snapshot without topic data still shows *something* unread.
-              unreadBadge(topicId > 0 && activeTopic
-                ? activeTopic.unread
-                : activeDialog?.isForum && (activeDialog.unreadTopics || 0) > 0
-                  ? activeDialog.unreadTopics
-                  : dialog.unread, dialog.muted),
+              // Badge semantics, computed from the ROW's own dialog (not the
+              // currently-open one) so every list row is correct at once:
+              //   • this row is the open dialog AND a specific topic is open →
+              //     that topic's unread count
+              //   • the row is a forum with unread topics → the number of
+              //     topics that have unread messages (matches native)
+              //   • otherwise → the row's raw unread message count
+              // The raw count stays the fallback so a snapshot without topic
+              // data still shows *something* unread.
+              (() => {
+                let value
+                if (dialog.key === dialogKey && topicId > 0 && activeTopic) {
+                  value = activeTopic.unread
+                } else if (dialog.isForum && (dialog.unreadTopics || 0) > 0) {
+                  value = dialog.unreadTopics
+                } else {
+                  value = dialog.unread
+                }
+                // ponytail: DEBUG — one line per row so a wrong counter is
+                // traceable (row key, chosen value, and why). Drop once the
+                // counter is confirmed correct in production.
+                console.debug(`[BADGE] row=${dialog.key} isForum=${!!dialog.isForum} unread=${dialog.unread} unreadTopics=${dialog.unreadTopics} shown=${value}`)
+                return unreadBadge(value, dialog.muted)
+              })(),
             ]
           }, dialog.key))
         }),

@@ -225,15 +225,20 @@ test('unread badge uses the verified Desktop contrast tokens and readable counts
 })
 
 test('forum dialogs badge on the number of topics with unread messages', () => {
-  // In a forum overview the badge must show the topic count (unreadTopics),
-  // not the raw message total; with a topic open it shows that topic's unread
-  // count; a plain dialog keeps the raw unread count. Match each fragment of
-  // the badge expression individually so whitespace churn doesn't break it.
-  assert.match(source, /unreadBadge\(topicId > 0 && activeTopic/)
-  assert.match(source, /\? activeTopic\.unread/)
-  assert.match(source, /: activeDialog\?\.isForum && \(activeDialog\.unreadTopics \|\| 0\) > 0/)
-  assert.match(source, /\? activeDialog\.unreadTopics/)
-  assert.match(source, /: dialog\.unread, dialog\.muted\)/)
+  // Each dialog ROW computes its own badge from its own dialog data (not the
+  // currently-open one): a forum row shows the topic count (unreadTopics), a
+  // plain row shows the raw unread count, and the open row with a specific
+  // topic open shows that topic's unread count.
+  assert.match(source, /dialog\.key === dialogKey && topicId > 0 && activeTopic/)
+  assert.match(source, /value = activeTopic\.unread/)
+  assert.match(source, /dialog\.isForum && \(dialog\.unreadTopics \|\| 0\) > 0/)
+  assert.match(source, /value = dialog\.unreadTopics/)
+  assert.match(source, /value = dialog\.unread/)
+  assert.match(source, /return unreadBadge\(value, dialog\.muted\)/)
+  // The old open-dialog-coupled expression must be gone: it made every row's
+  // badge depend on which dialog was selected, so an unselected forum row
+  // fell through to its raw unread total (e.g. 44 instead of 1).
+  assert.doesNotMatch(source, /activeDialog\?\.isForum && \(activeDialog\.unreadTopics \|\| 0\) > 0/)
 })
 
 test('folder tabs remain horizontally scrollable in a constrained narrow header', () => {
