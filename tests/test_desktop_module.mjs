@@ -181,8 +181,11 @@ function makeTelegramPane(dialogs, messages = []) {
 test('settings default to manual refresh', () => {
   const load = loadFunction('loadSettings', 'unreadBadge', defaults)
   assert.deepEqual(load({ get: () => null }, 'k'), { autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
+  // autoRefresh is a period in ms (30000/60000) or false; legacy true maps to 60s.
   assert.deepEqual(load({ get: () => ({ autoRefresh: true, unmutedOnly: true, unreadOnly: true, tab: '42', junk: 1 }) }, 'k'),
-    { autoRefresh: true, unmutedOnly: true, unreadOnly: true, confirmActions: true, tab: '42' })
+    { autoRefresh: 60000, unmutedOnly: true, unreadOnly: true, confirmActions: true, tab: '42' })
+  assert.deepEqual(load({ get: () => ({ autoRefresh: 30000 }) }, 'k'),
+    { autoRefresh: 30000, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
   assert.deepEqual(load({ get: () => ({ autoRefresh: 'yes', tab: 'nope' }) }, 'k'),
     { autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
   // Explicit opt-out is preserved; anything else defaults confirmation on.
@@ -293,8 +296,13 @@ test('mark-read actions preserve the selected post and forum topic ID', () => {
   assert.ok(/Mark whole forum read/.test(source), 'whole-forum action is explicit')
   assert.ok(/action\('Mark read up to here', \(\) => \{ void requestMarkRead\(message\.id, topicId\) \}/.test(source), 'message action preserves its selected ID')
   assert.ok(/requestMarkRead\(activeDialog\.topMessageId, 0\)/.test(source), 'chat action uses the visible chat ceiling')
-  assert.ok(/'Mark topic as read',/.test(source), 'in-topic action targets the current topic')
+  assert.ok(/'Mark topic as read'/.test(source), 'in-topic action targets the current topic')
   assert.ok(/requestMarkRead\(activeTopic\.topMessage, topicId\)/.test(source), 'topic action uses the topic ceiling')
+})
+
+test('per-post save action forwards the message to Saved Messages via prepare/confirm', () => {
+  assert.ok(/action\('Save', \(\) => \{ void prepareAndConfirm\(\{ action: 'save', peer: dialogKey, messageId: message\.id \}\) \}, waiting/.test(source), 'Save button is wired to the prepare/confirm flow')
+  assert.ok(/title: 'Save to Saved Messages'/.test(source), 'Save button carries its Saved Messages title')
 })
 
 test('forum topics are fetched by stable ID and selected before their messages are loaded', () => {

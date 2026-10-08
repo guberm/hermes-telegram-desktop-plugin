@@ -882,6 +882,87 @@ class MarkReadActionTests(unittest.TestCase):
         self.assertLessEqual(calls[0], 200, "readback fetch must stay bounded")
 
 
+class SaveActionTests(unittest.TestCase):
+    def setUp(self):
+        self.request = SimpleNamespace(query_params={})
+        self.scope = "save-scope" * 3
+        self.binding = MODULE._ScopeBinding("backend", "/home", "me", 0)
+        self.entity = SimpleNamespace(id=123, title="Test Group", username="group", forum=True)
+        self.target = make_message(321, "keep me")
+        self.saved = None  # type: ignore[assignment]
+        self.forwards = []
+
+        class Client:
+            async def get_entity(inner, peer):
+                return self.entity
+
+            async def get_me(inner):
+                return SimpleNamespace(id=1)
+
+            async def get_messages(inner, entity, ids):
+                if ids == 321:
+                    return self.target
+                if ids == 777:
+                    return self.saved
+                return None
+
+            async def forward_messages(inner, dest, messages):
+                self.forwards.append((dest, messages))
+                message = SimpleNamespace(
+                    id=777,
+                    message="keep me",
+                    date=None,
+                    out=True,
+                    unread=False,
+                    sender=SimpleNamespace(id=1, first_name="Me", last_name=None, username=None, title=None),
+                    chat=SimpleNamespace(id=777001, title="Saved Messages", first_name=None, last_name=None, username=None),
+                    media=None,
+                    reply_to=None,
+                    sender_id=1,
+                    forward=SimpleNamespace(id=321),
+                )
+                self.saved = message
+                return [message]
+
+        self.client = Client()
+
+        async def with_client(handler):
+            return await handler(self.client)
+
+        self.patches = (
+            patch.object(MODULE, "_binding", return_value=self.binding),
+            patch.object(MODULE, "_provider_context", return_value=("me", "/home")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        )
+        for item in self.patches:
+            item.start()
+        self.addCleanup(lambda: [item.stop() for item in reversed(self.patches)])
+
+    def test_prepare_and_commit_save_to_saved_messages_with_readback(self):
+        prepared = MODULE.prepare_action(self.request, MODULE.SavePrepare(
+            scope=self.scope, action="save", peer="@group", messageId=321,
+        ))
+        self.assertEqual(prepared["preview"]["action"], "save")
+        self.assertEqual(prepared["preview"]["targetMessage"]["id"], 321)
+        self.assertEqual(self.forwards, [], "prepare must not forward anything")
+        result = MODULE.commit_action(self.request, MODULE.CommitRequest(
+            scope=self.scope, confirmationToken=prepared["confirmationToken"], confirmed=True,
+        ))
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["id"], 777)
+        self.assertEqual(self.forwards, [("me", [321])])
+
+    def test_prepare_save_missing_source_fails_closed(self):
+        # A vanished source message must be rejected before any ticket exists.
+        with self.assertRaises(HTTPException) as raised:
+            MODULE.prepare_action(self.request, MODULE.SavePrepare(
+                scope=self.scope, action="save", peer="@group", messageId=999,
+            ))
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(self.forwards, [], "no ticket, no forward")
+
+
 class ForumTopicsRouteTests(unittest.TestCase):
     def test_topics_serialization_and_nonforum_detection(self):
         from telethon.tl.types import ForumTopic, ForumTopicDeleted, PeerChannel, PeerNotifySettings, PeerUser

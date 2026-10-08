@@ -147,8 +147,15 @@ class DeletePrepare(_StrictModel):
     messageId: int = Field(ge=1, le=10_000_000_000)
 
 
+class SavePrepare(_StrictModel):
+    scope: ScopeText
+    action: Literal["save"]
+    peer: Annotated[str, StringConstraints(min_length=1, max_length=256)]
+    messageId: int = Field(ge=1, le=10_000_000_000)
+
+
 PrepareRequest = Annotated[
-    SendPrepare | ReplyPrepare | MarkReadPrepare | DeletePrepare,
+    SendPrepare | ReplyPrepare | MarkReadPrepare | DeletePrepare | SavePrepare,
     Field(discriminator="action"),
 ]
 
@@ -1031,7 +1038,7 @@ def prepare_action(request: Request, body: PrepareRequest) -> dict[str, Any]:
     expires = _now() + _TICKET_TTL_SECONDS
 
     async def _inspect(client: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        if body.action in {"send", "reply", "delete", "mark-read"}:
+        if body.action in {"send", "reply", "delete", "mark-read", "save"}:
             entity, name = await _peer_out(client, body.peer)
         if body.action == "send":
             preview = {
@@ -1077,6 +1084,19 @@ def prepare_action(request: Request, body: PrepareRequest) -> dict[str, Any]:
                 "maxId": body.maxId,
                 "topicId": body.topicId,
                 "unreadNow": unread_now,
+                "targetMessage": snapshot,
+            }
+            return preview, snapshot
+        if body.action == "save":
+            target = await client.get_messages(entity, ids=body.messageId)
+            if target is None:
+                raise _peer_ref_error("Message to save no longer exists.")
+            snapshot = _public_message(target, await _me_id(client))
+            preview = {
+                "action": "save",
+                "me": me,
+                "peer": name,
+                "peerKey": _peer_key(entity),
                 "targetMessage": snapshot,
             }
             return preview, snapshot
@@ -1227,6 +1247,13 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
             else:
                 await client.send_read_acknowledge(entity, max_id=payload["maxId"])
             return {"peer": name, "maxId": payload["maxId"]}
+        if action == "save":
+            target = await client.get_messages(entity, ids=payload["messageId"])
+            if target is None:
+                raise HTTPException(status_code=409, detail="Message no longer exists; nothing to save.")
+            forwarded = await client.forward_messages("me", [payload["messageId"]])
+            sent = forwarded[0] if isinstance(forwarded, list) else forwarded
+            return {"sentId": int(sent.id), "peer": name}
         target = await client.get_messages(entity, ids=payload["messageId"])
         if target is None:
             raise HTTPException(status_code=409, detail="Message already deleted; nothing to do.")
@@ -1281,6 +1308,11 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
             if topic_id:
                 result["topicId"] = topic_id
             return result
+        if action == "save":
+            saved = await client.get_messages("me", ids=outcome["sentId"])
+            if saved is None or int(getattr(getattr(saved, "forward", None), "id", 0) or 0) != int(payload["messageId"]):
+                raise ValueError("saved message readback mismatch")
+            return {"status": "verified", "id": int(saved.id), "peer": name}
         # delete
         message = await client.get_messages(entity, ids=payload["messageId"])
         if message is not None:

@@ -506,7 +506,7 @@ export function loadSettings(storage, key) {
     const raw = storage.get(key, null)
     if (!raw || typeof raw !== 'object') return { ...DEFAULT_SETTINGS }
     return {
-      autoRefresh: raw.autoRefresh === true,
+      autoRefresh: raw.autoRefresh === 30000 || raw.autoRefresh === 60000 ? raw.autoRefresh : raw.autoRefresh === true ? 60000 : false,
       unmutedOnly: raw.unmutedOnly === true,
       unreadOnly: raw.unreadOnly === true,
       confirmActions: raw.confirmActions !== false,
@@ -618,7 +618,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     queryKey: [...queryPrefix, scope, 'dialogs', folder, unreadOnly, settings.unmutedOnly],
     queryFn: () => read(consumeDialogsRequestPath(forcedNextDialogsRefresh)),
     placeholderData: previous => previous,
-    refetchInterval: settings.autoRefresh ? 60000 : false,
+    refetchInterval: settings.autoRefresh === false ? false : settings.autoRefresh,
     enabled: !statusUnavailable,
   })
   const dialogsList = Array.isArray(dialogsQuery.data?.dialogs) ? dialogsQuery.data.dialogs : []
@@ -627,7 +627,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     queryKey: [...queryPrefix, scope, 'topics', dialogKey],
     queryFn: () => read('/topics?' + new URLSearchParams({ peer: dialogKey, limit: '50' })),
     enabled: !!dialogKey && !!activeDialog?.isForum && topicId === 0 && !statusUnavailable,
-    refetchInterval: settings.autoRefresh ? 60000 : false,
+    refetchInterval: settings.autoRefresh === false ? false : settings.autoRefresh,
   })
   const topicsList = Array.isArray(topicsQuery.data?.topics) ? topicsQuery.data.topics : []
   const activeTopic = topicsList.find(topic => topic.id === topicId)
@@ -636,7 +636,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     queryKey: [...queryPrefix, scope, 'messages', dialogKey, topicId],
     queryFn: () => read('/messages?' + new URLSearchParams({ peer: dialogKey, limit: '30', topicId: String(topicId) })),
     enabled: !!dialogKey && !statusUnavailable && (!activeDialog?.isForum || topicId > 0),
-    refetchInterval: settings.autoRefresh ? 60000 : false,
+    refetchInterval: settings.autoRefresh === false ? false : settings.autoRefresh,
   })
   const messagesList = Array.isArray(messagesQuery.data?.messages) ? messagesQuery.data.messages : []
   const mutation = useMutation({ retry: false, gcTime: 0, mutationFn: ({ path, body }) => ctx.rest(path, { method: 'POST', body, timeoutMs: 60000 }) })
@@ -772,26 +772,16 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     jsxs('div', { style: { ...stack, width: '100%', minWidth: 0, gap: '0.35rem' }, children: [
       jsxs('div', { style: { ...row, justifyContent: 'space-between', flexWrap: 'wrap', minWidth: 0 }, children: [
         jsx('strong', { children: `Telegram — ${me}` }),
-        // Auto-refresh period selector
-        {
-          'data-testid': 'auto-refresh-selector',
-          style: { mr: '1rem' },
-          children: auto === false ? 'Off' : auto === 30 ? '30s' : '60s'
-        }
-        {/* selector dropdown handled elsewhere */}
-        {/* onClick opens the period selector modal or dropdown — in this lite version we simply invert toggle */
-        }
-
-        action(auto === false ? 'Turn on auto-refresh (30s)' : auto <= 60 ? 'Turn off auto-refresh' : 'Turn off auto-refresh', () => {
-          // toggle between off and 30s/60s in round-robin
-          setSettings(current => {
-            const next = current.autoRefresh === false ? 30 : current.autoRefresh === 30 ? 60 : false;
-            return { ...current, autoRefresh: next };
-          })
-        })
-            setSettings(current => ({ ...current, autoRefresh: !current.autoRefresh })), false),
-          action(dialogsQuery.isFetching ? 'Refreshing…' : 'Refresh', () => { void refreshAll(true) }, dialogsQuery.isFetching || waiting),
-          action('New message', () => beginCompose(''), waiting)
+        jsxs('div', { style: { ...row, flexWrap: 'wrap' }, children: [
+        // Auto-refresh period: Off / 30s / 60s. Clicking the button cycles to
+        // the next period; the label always shows the active one.
+        jsx('span', { 'data-testid': 'auto-refresh-state', style: { ...muted, fontSize: '0.8rem', whiteSpace: 'nowrap' },
+          children: settings.autoRefresh === false ? 'auto: off' : `auto: ${settings.autoRefresh / 1000}s` }),
+        action(settings.autoRefresh === false ? 'Auto-refresh: 30s' : settings.autoRefresh === 30000 ? 'Auto-refresh: 60s' : 'Auto-refresh: off', () => {
+          setSettings(current => ({ ...current, autoRefresh: current.autoRefresh === false ? 30000 : current.autoRefresh === 30000 ? 60000 : false }))
+        }, false, { title: 'Cycle auto-refresh period: off / 30s / 60s' }),
+        action(dialogsQuery.isFetching ? 'Refreshing…' : 'Refresh', () => { void refreshAll(true) }, dialogsQuery.isFetching || waiting),
+        action('New message', () => beginCompose(''), waiting)
         ] })
       ] }),
       tabBar,
@@ -938,6 +928,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
                   ? action('Open post in browser', () => { void ctx.os.openExternal(postLink) }, false, { title: postLink })
                   : null
               })(),
+              action('Save', () => { void prepareAndConfirm({ action: 'save', peer: dialogKey, messageId: message.id }) }, waiting, { title: 'Save to Saved Messages' }),
               action('Delete', () => prepareAndConfirm({ action: 'delete', peer: dialogKey, messageId: message.id }),
                 waiting || !message.mine),
               message.replyTo && jsx('span', { style: muted, children: `↩ ${message.replyTo}` })
