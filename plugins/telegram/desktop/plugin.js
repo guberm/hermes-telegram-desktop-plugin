@@ -772,8 +772,23 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     jsxs('div', { style: { ...stack, width: '100%', minWidth: 0, gap: '0.35rem' }, children: [
       jsxs('div', { style: { ...row, justifyContent: 'space-between', flexWrap: 'wrap', minWidth: 0 }, children: [
         jsx('strong', { children: `Telegram — ${me}` }),
-        jsxs('div', { style: { ...row, flexWrap: 'wrap' }, children: [
-        action(settings.autoRefresh ? 'Turn off auto-refresh' : 'Auto-refresh (60s)', () =>
+        // Auto-refresh period selector
+        {
+          'data-testid': 'auto-refresh-selector',
+          style: { mr: '1rem' },
+          children: auto === false ? 'Off' : auto === 30 ? '30s' : '60s'
+        }
+        {/* selector dropdown handled elsewhere */}
+        {/* onClick opens the period selector modal or dropdown — in this lite version we simply invert toggle */
+        }
+
+        action(auto === false ? 'Turn on auto-refresh (30s)' : auto <= 60 ? 'Turn off auto-refresh' : 'Turn off auto-refresh', () => {
+          // toggle between off and 30s/60s in round-robin
+          setSettings(current => {
+            const next = current.autoRefresh === false ? 30 : current.autoRefresh === 30 ? 60 : false;
+            return { ...current, autoRefresh: next };
+          })
+        })
             setSettings(current => ({ ...current, autoRefresh: !current.autoRefresh })), false),
           action(dialogsQuery.isFetching ? 'Refreshing…' : 'Refresh', () => { void refreshAll(true) }, dialogsQuery.isFetching || waiting),
           action('New message', () => beginCompose(''), waiting)
@@ -835,7 +850,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             },
             children: [
               jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: dialog.unread > 0 && !dialog.muted ? 700 : 400 }, children: `${dialog.muted ? '🔇 ' : ''}${dialog.name || dialog.key}` }),
-              unreadBadge(dialog.unread, dialog.muted),
+              unreadBadge(topicId > 0 && activeTopic ? activeTopic.unread : dialog.unread, dialog.muted),
             ]
           }, dialog.key))
         }),
