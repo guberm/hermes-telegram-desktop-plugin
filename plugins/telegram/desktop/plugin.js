@@ -972,7 +972,7 @@ function Connected({ ctx, profile }) {
   // The dedicated session exists but is not logged in yet: /status answers 503
   // "not authorized". Show the standalone login panel; hide it once authorized.
   const needsLogin = status.isError && /authoriz/i.test(String(status.error?.message || '') + String(status.error?.body || ''))
-  return jsxs('main', { style: { ...stack, height: '100%', overflow: 'auto', padding: '1rem', color: 'var(--ui-text-primary)' }, children: [
+  return jsxs('main', { style: { ...stack, height: '100%', overflow: 'auto', padding: '1rem', color: 'var(--ui-text-primary)', background: 'var(--ui-bg-primary, var(--ui-card))' }, children: [
     jsx('h1', { children: 'Telegram' }),
     note('Read dialogs and history as reference. Every send, reply, delete, or mark-read requires review and backend confirmation.'),
     status.isPending && note('Connecting to the current Telegram backend…'),
