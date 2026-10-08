@@ -305,6 +305,11 @@ test('per-post save action forwards the message to Saved Messages via prepare/co
   assert.ok(/title: 'Save to Saved Messages'/.test(source), 'Save button carries its Saved Messages title')
 })
 
+test('delete is available on every post, not only own messages', () => {
+  assert.ok(/action\('Delete', \(\) => prepareAndConfirm\(\{ action: 'delete', peer: dialogKey, messageId: message\.id \}\),\n\s*waiting\)/.test(source), 'Delete is gated only by the pending guard, never by message.mine')
+  assert.equal(/!message\.mine\)/.test(source), false, 'no ownership pre-gate may disable the Delete button')
+})
+
 test('forum topics are fetched by stable ID and selected before their messages are loaded', () => {
   assert.ok(/read\('\/topics\?' \+ new URLSearchParams\(\{ peer: dialogKey, limit: '50' \}\)\)/.test(source), 'topics use the explicit peer')
   assert.ok(/enabled: !!dialogKey && !!activeDialog\?\.isForum/.test(source), 'topics load only for forum dialogs')

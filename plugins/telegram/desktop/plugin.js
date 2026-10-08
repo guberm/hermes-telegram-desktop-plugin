@@ -932,7 +932,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
               })(),
               action('Save', () => { void prepareAndConfirm({ action: 'save', peer: dialogKey, messageId: message.id }) }, waiting, { title: 'Save to Saved Messages' }),
               action('Delete', () => prepareAndConfirm({ action: 'delete', peer: dialogKey, messageId: message.id }),
-                waiting || !message.mine),
+                waiting),
               message.replyTo && jsx('span', { style: muted, children: `↩ ${message.replyTo}` })
             ] })
           ] }, `${message.id}`))
