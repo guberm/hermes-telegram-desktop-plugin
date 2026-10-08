@@ -1391,14 +1391,28 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
                 await client.send_read_acknowledge(entity, max_id=payload["maxId"])
             return {"peer": name, "maxId": payload["maxId"]}
         if action == "save":
+            # DEBUG: forward with from_peer — ensures Telethon does not raise
+            # ValueError('from_peer must be given if integer IDs are used').
+            # Before this fix the call lacked from_peer and every save failed
+            # with a wrapped provider error. Log entry/exit so operators can
+            # confirm the path is exercised without breaking the JSON payload.
+            print(
+                f"[SAVE] from_peer=entity; messageId={payload['messageId']} "
+                f"peer={payload['peer']}",
+                file=sys.stderr,
+            )
             target = await client.get_messages(entity, ids=payload["messageId"])
             if target is None:
-                raise HTTPException(status_code=409, detail="Message no longer exists; nothing to save.")
+                raise _peer_ref_error("Message to save no longer exists.")
             # from_peer is required when forwarding by integer IDs: it tells
             # Telethon which chat the message belongs to. Without it, the
             # client raises ValueError before the RPC is sent.
             forwarded = await client.forward_messages("me", [payload["messageId"]], from_peer=entity)
             sent = forwarded[0] if isinstance(forwarded, list) else forwarded
+            print(
+                f"[SAVE] forwarded id={sent.id} peer_name={name}",
+                file=sys.stderr,
+            )
             return {"sentId": int(sent.id), "peer": name}
         target = await client.get_messages(entity, ids=payload["messageId"])
         if target is None:
