@@ -767,6 +767,12 @@ class PublicMessageTests(unittest.TestCase):
         self.assertEqual(item["peer"], "Test Group")
         self.assertFalse(item["mine"])
         self.assertEqual(item["text"], "hello world")
+        self.assertFalse(item["hasImage"])
+
+    def test_public_message_marks_image_posts_for_reload(self):
+        message = make_message()
+        message.photo = object()
+        self.assertTrue(public(message)["hasImage"])
 
     def test_snapshot_is_deterministic(self):
         first = MODULE._message_snapshot(public(make_message()))

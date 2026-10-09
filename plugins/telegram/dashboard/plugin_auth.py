@@ -164,11 +164,20 @@ def _masked_phone(phone: str) -> str:
 def _public_stage(state: dict[str, Any]) -> dict[str, Any]:
     result = {"stage": state.get("stage", "idle"), "phone": _masked_phone(state.get("phone", "")),
               "me": state.get("me", ""), "qrToken": state.get("qr_token_b64", ""),
+              "qrMatrix": None,
               "codeType": state.get("codeType", ""), "nextType": state.get("nextType", ""),
               "resendIn": max(0, int(state.get("resendAt", 0) - time.time())) if state.get("resendAt") else 0,
               "emailCodeSent": bool(state.get("emailCodeSent", False)),
               "hint": state.get("hint", ""), "hasRecovery": bool(state.get("hasRecovery", False)),
               "emailPattern": state.get("recoveryEmailPattern", state.get("emailPattern", ""))}
+    token = result["qrToken"]
+    if token and result["stage"] == "qr-pending":
+        import qrcode
+
+        qr = qrcode.QRCode(border=0)
+        qr.add_data(f"tg://login?token={token}")
+        qr.make(fit=True)
+        result["qrMatrix"] = qr.get_matrix()
     return result
 
 

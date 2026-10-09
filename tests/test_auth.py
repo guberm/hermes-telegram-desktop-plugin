@@ -74,6 +74,12 @@ class AuthStateTests(unittest.IsolatedAsyncioTestCase):
         auth._VOLATILE_STATE.clear()
         auth._QR_TASK.clear()
 
+    def test_qr_stage_returns_boolean_matrix_for_backend_painter(self):
+        stage = auth._public_stage({"stage": "qr-pending", "qr_token_b64": "dGVzdC10b2tlbg"})
+        matrix = stage["qrMatrix"]
+        self.assertGreaterEqual(len(matrix), 21)
+        self.assertTrue(all(len(row) == len(matrix) and all(type(cell) is bool for cell in row) for row in matrix))
+
     async def test_sent_code_union_keeps_challenge_only_in_memory(self):
         with tempfile.TemporaryDirectory() as temp:
             state_path = Path(temp) / "auth_state.json"

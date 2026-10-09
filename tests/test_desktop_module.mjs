@@ -56,23 +56,10 @@ test('resend countdown ticks each second, clamps to zero, and cleans up its time
   assert.equal(cancelled, 42)
 })
 
-test('bundled login QR encoder returns a structurally valid matrix', () => {
-  const start = source.indexOf('var QRCore=(()=>')
-  const end = source.indexOf('\nfunction QrImage(', start)
-  assert.ok(start > 0 && end > start, 'inline QR core and render wrapper are present')
-  const code = source.slice(start, end)
-    .replace('export function renderLoginQr', 'function renderLoginQr') +
-    '\nglobalThis.renderLoginQr = renderLoginQr'
-  const context = { TextEncoder }
-  vm.runInNewContext(code, context)
-  const matrix = context.renderLoginQr('tg://login?token=unit-test-token-1234567890')
-  assert.ok(Array.isArray(matrix))
-  assert.ok(matrix.length >= 21 && matrix.length <= 177 && matrix.length % 4 === 1)
-  assert.ok(matrix.every(row => Array.isArray(row) && row.length === matrix.length && row.every(x => typeof x === 'boolean')))
-  // Top-left finder pattern and its central 3x3 block are preserved.
-  assert.equal(matrix[0][0], true)
-  assert.equal(matrix[1][1], false)
-  assert.equal(matrix[3][3], true)
+test("login QR is painted from the backend matrix, without a bundled encoder", () => {
+  assert.doesNotMatch(source, /QRCore|renderLoginQr/)
+  assert.match(source, /function QrImage\(\{ matrix \}\)/)
+  assert.match(source, /qrMatrix/)
 })
 
 test('every referenced module-level helper is declared', () => {

@@ -13,7 +13,7 @@ import asyncio
 import base64
 import importlib.util
 import json
-import logging
+import os
 import re
 import secrets
 import sys
@@ -31,21 +31,6 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 router = APIRouter()
-
-# Structured, no-secrets debug log. The Hermes agent captures stderr, so this
-# is the single place to see what the backend actually did on each mutation —
-# peer, message id, commit/verify outcomes, timings, and the exact exception
-# that gets wrapped into a 502. Log at DEBUG; the handler is attached once at
-# import time (idempotent) so it does not depend on host log config.
-logger = logging.getLogger("hermes.telegram_desktop")
-if not logger.handlers:
-    _handler = logging.StreamHandler(sys.stderr)
-    _handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S",
-    ))
-    logger.addHandler(_handler)
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False
 
 # One shared TelegramClient per dedicated profile session; each instance is
 # serialized by its own owner loop and guarded by the on-disk process lock.
@@ -353,22 +338,25 @@ def _current_home() -> str:
 
 
 def _load_telegram_credentials() -> tuple[int, str]:
-    """Resolve API credentials without requiring or reading an RSS session path."""
-
+    api_id, api_hash = os.getenv("TELEGRAM_API_ID"), os.getenv("TELEGRAM_API_HASH")
+    if api_id and api_hash:
+        try:
+            parsed_id = int(api_id)
+        except ValueError:
+            parsed_id = 0
+        if parsed_id > 0:
+            return parsed_id, api_hash
     path = Path(_current_home()) / "rss_reader" / "config.json"
-    if not path.is_file():
-        raise _AuthUnavailable("missing Telegram API configuration")
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # pragma: no cover - defensive
-        raise _AuthUnavailable("invalid Telegram API configuration") from exc
+    except (OSError, ValueError):
+        raise _AuthUnavailable("missing Telegram API configuration") from None
     if not isinstance(config, dict):
         raise _AuthUnavailable("invalid Telegram API configuration")
-    api_id = config.get("api_id")
-    api_hash = config.get("api_hash")
-    if not isinstance(api_id, int) or api_id <= 0 or not isinstance(api_hash, str) or not api_hash:
-        raise _AuthUnavailable("incomplete Telegram API configuration")
-    return api_id, api_hash
+    api_id, api_hash = config.get("api_id"), config.get("api_hash")
+    if isinstance(api_id, int) and api_id > 0 and isinstance(api_hash, str) and api_hash:
+        return api_id, api_hash
+    raise _AuthUnavailable("incomplete Telegram API configuration")
 
 
 def _dedicated_session_path() -> Path:
@@ -540,6 +528,7 @@ def _public_message(message: Any, me_id: int) -> dict[str, Any]:
         "text": display_text,
         "htmlPreview": html_preview,
         "media": media_kind,
+        "hasImage": _message_has_image_media(message),
         "replyTo": int(message.reply_to.reply_to_msg_id) if message.reply_to else None,
         "replyToTop": int(message.reply_to.reply_to_top_id) if getattr(message.reply_to, "reply_to_top_id", None) else None,
         "mine": bool(message.out) or (message.sender_id == me_id if message.sender_id is not None else False),
@@ -699,11 +688,6 @@ def _apply_dialog_filters(dialogs: list[Any], telegram_filters: list[Any], unrea
                     folder_pins.append(ident)
         is_forum = bool(getattr(entity, "forum", False))
         unread_topics_value = int(unread_topics.get(dialog_key, 0) or 0)
-        logger.info(
-            "dialog row key=%s name=%s unread=%d unreadTopics=%d isForum=%s topMessageId=%s",
-            dialog_key, _peer_display_name(entity), unread, unread_topics_value,
-            is_forum, int(getattr(getattr(dialog, "message", None), "id", 0) or 0),
-        )
         rows.append({
             "key": dialog_key,
             "name": _peer_display_name(entity),
@@ -939,7 +923,6 @@ def dialogs(
             # not the raw message total). Only real forums pay this cost — a
             # non-forum megagroup would make the scan pointless.
             unread_topics: dict[str, int] = {}
-            forum_count = 0
             for dialog in result:
                 entity = getattr(dialog, "entity", None)
                 if entity is None:
@@ -947,21 +930,11 @@ def dialogs(
                 is_forum = getattr(entity, "forum", False)
                 if not is_forum:
                     continue
-                forum_count += 1
-                logger.info(
-                    "forum scan key=%s entityId=%s title=%s",
-                    _peer_key(entity), entity.id, getattr(entity, "title", "?"),
-                )
                 try:
                     topic_count = await _unread_topics_count(client, entity)
                     unread_topics[_peer_key(entity)] = topic_count
-                    logger.info("forum scan ok topicsWithUnread=%s key=%s", topic_count, _peer_key(entity))
                 except Exception:
-                    logger.exception("forum scan failed key=%s (falling back to raw unread)", _peer_key(entity))
-            logger.info(
-                "forum scan summary forumDialogs=%d keysBuilt=%d snapshotSize=%d refresh=%s",
-                forum_count, len(unread_topics), len(result), refresh,
-            )
+                    pass
             response = await client(functions.messages.GetDialogFiltersRequest())
             telegram_filters = [
                 definition for definition in (getattr(response, "filters", None) or [])
@@ -1294,6 +1267,7 @@ def prepare_action(request: Request, body: PrepareRequest) -> dict[str, Any]:
         snapshot = _public_message(target, await _me_id(client))
         preview = {
             "action": "delete",
+            "effect": "Delete for everyone",
             "me": me,
             "peer": name,
             "peerKey": _peer_key(entity),
@@ -1433,27 +1407,21 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
                 ))
             else:
                 await client.send_read_acknowledge(entity, max_id=payload["maxId"])
-            logger.info(
-                "mark-read committed peer=%s maxId=%s topicId=%s",
-                name, payload["maxId"], topic_id,
-            )
             return {"peer": name, "maxId": payload["maxId"]}
         if action == "save":
             # from_peer is required when forwarding by integer IDs: it tells
             # Telethon which chat the message belongs to. Without it, the
             # client raises ValueError before the RPC is sent.
-            logger.info("save commit peer=%s messageId=%s", name, payload["messageId"])
             target = await client.get_messages(entity, ids=payload["messageId"])
             if target is None:
                 raise _peer_ref_error("Message to save no longer exists.")
             forwarded = await client.forward_messages("me", [payload["messageId"]], from_peer=entity)
             sent = forwarded[0] if isinstance(forwarded, list) else forwarded
-            logger.info("save commit ok sentId=%s peer=%s", sent.id, name)
             return {"sentId": int(sent.id), "peer": name}
         target = await client.get_messages(entity, ids=payload["messageId"])
         if target is None:
             raise HTTPException(status_code=409, detail="Message already deleted; nothing to do.")
-        await client.delete_messages(entity, payload["messageId"])
+        await client.delete_messages(entity, payload["messageId"], revoke=True)
         return {"deletedId": payload["messageId"], "peer": name}
 
     try:
@@ -1463,7 +1431,6 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception:
-        logger.exception("commit failed action=%s peer=%s", payload.get("action"), payload.get("peer"))
         raise _provider_error(mutation_started=True) from None
 
     # Read back the exact resulting state; the RPC return is not proof.
@@ -1497,10 +1464,6 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
                 after_dialog = next((d for d in fresh if _dialog_match(d, entity)), None)
                 unread_after = int(getattr(after_dialog, "unread_count", 0) or 0) if after_dialog is not None else 0
                 cursor = _dialog_read_cursor(after_dialog) if after_dialog is not None else 0
-            logger.info(
-                "mark-read readback peer=%s maxId=%s cursor=%s unreadAfter=%s",
-                name, max_id, cursor, unread_after,
-            )
             # A bounded read must advance the exact chat/topic cursor through
             # the requested post; newer posts may remain unread.
             if cursor < max_id:
@@ -1531,11 +1494,6 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
                 if saved is not None and int(getattr(saved, "id", 0) or 0) != int(outcome["sentId"]):
                     saved = None
             header = getattr(saved, "fwd_from", None)
-            logger.info(
-                "save readback sentId=%s found=%s forwardFrom=%s forwardDate=%s",
-                outcome["sentId"], saved is not None,
-                getattr(header, "from_id", None), getattr(header, "date", None),
-            )
             if saved is None:
                 raise ValueError("saved message not found on readback")
             return {"status": "verified", "id": int(saved.id), "peer": name}
@@ -1548,9 +1506,7 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
     try:
         result = _run_async(_with_client(_verify))
     except Exception:
-        logger.exception("verify failed action=%s peer=%s", action, payload.get("peer"))
         raise _provider_error(mutation_started=True) from None
-    logger.info("mutated action=%s peer=%s result=%s", action, payload.get("peer"), result)
     if action == "mark-read":
         _DIALOG_CACHE.pop(body.scope, None)
     return result

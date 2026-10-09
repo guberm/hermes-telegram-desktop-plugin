@@ -1,4 +1,4 @@
 {
-  "name": "telegram",
+  "name": "telegram-client",
   "api": "plugin_api.py"
 }
