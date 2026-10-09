@@ -119,7 +119,11 @@ _TICKET_TTL_SECONDS = 300.0
 _MAX_TICKETS = 256
 _MAX_SCOPES = 128
 _MAX_PROVIDER_TEXT = 16 * 1024
-_MAX_MEDIA_PREVIEW_MESSAGES = 6
+# Media previews are bounded per page by payload size, not by image count:
+# every image post in the visible window carries its picture while the
+# budget lasts, and the 64-entry cache (~15 MB) keeps repeat polls cheap.
+# ~1.5 MB of base64 per page keeps the /messages JSON payload bounded.
+_MAX_MEDIA_PREVIEW_PAGE_BYTES = 1_500_000
 # Forum topic scan: GetForumTopicsRequest pages at 100 at a time; bound the
 # total so a pathological forum can't stall the dialogs snapshot.
 _FORUM_TOPIC_PAGE = 100
@@ -1079,18 +1083,22 @@ def messages(
             kwargs.update(min_id=cursor - 1, reverse=True)
         own_id = await _me_id(client)
         found: list[dict[str, Any]] = []
-        preview_count = 0
+        preview_bytes = 0
         async for message in client.iter_messages(entity, **kwargs):
             if general_topic and not _message_is_general_topic(message):
                 continue
             item = _public_message(message, own_id or 0)
-            if preview_count < _MAX_MEDIA_PREVIEW_MESSAGES and _message_has_image_media(message):
+            if _message_has_image_media(message):
+                # ponytail: page budget is base64 chars (~1.5 MB), not an image
+                # count — every image post in the visible window keeps its
+                # picture while the budget lasts. Bump the constant, not the
+                # code, if a huge image-dense page proves too heavy.
                 message_id = item.get("id")
                 cached_preview = _media_preview_get(scope, message_id) if isinstance(message_id, int) else None
-                if cached_preview is not None:
+                if cached_preview is not None and preview_bytes + len(cached_preview) <= _MAX_MEDIA_PREVIEW_PAGE_BYTES:
                     item["mediaPreview"] = cached_preview
-                    preview_count += 1
-                else:
+                    preview_bytes += len(cached_preview)
+                elif preview_bytes < _MAX_MEDIA_PREVIEW_PAGE_BYTES:
                     try:
                         # -1 = the largest available photo size (native Telegram
                         # uses this for full-size viewing); the old thumb=0
@@ -1100,9 +1108,9 @@ def messages(
                     except Exception:
                         raw_preview = None
                     preview = _media_preview_data_uri(raw_preview)
-                    if preview:
+                    if preview and preview_bytes + len(preview) <= _MAX_MEDIA_PREVIEW_PAGE_BYTES:
                         item["mediaPreview"] = preview
-                        preview_count += 1
+                        preview_bytes += len(preview)
                         if isinstance(message_id, int):
                             _media_preview_put(scope, message_id, preview)
             found.append(item)

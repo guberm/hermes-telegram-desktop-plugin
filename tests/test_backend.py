@@ -574,6 +574,67 @@ class PublicMessageTests(unittest.TestCase):
                 p.stop()
         self.assertEqual(client.downloads, 1, "second refresh must not re-download")
 
+    def test_messages_preview_all_image_posts_within_byte_budget(self):
+        # Regression: previews were once capped at 6 images per page, so on
+        # an image-dense feed every post after the 6th rendered without a
+        # picture. The cap is now a page byte budget — every image post in
+        # the window keeps its picture while the budget lasts.
+        MODULE._media_previews.clear()
+
+        image_bytes = b"\x89PNG\r\n\x1a\n" + b"0" * 3000
+        messages = []
+        for mid in range(1, 21):
+            msg = make_message(mid)
+            msg.media = SimpleNamespace()
+            msg.photo = SimpleNamespace()
+            msg.document = None
+            messages.append(msg)
+
+        class Client:
+            downloads = 0
+
+            async def get_entity(self, peer):
+                return SimpleNamespace(id=-100123, title="Test Group")
+
+            async def get_me(self):
+                return SimpleNamespace(id=1)
+
+            async def get_dialogs(self, limit=None):
+                return []
+
+            async def iter_messages(self, entity, **kwargs):
+                for msg in messages:
+                    yield msg
+
+            async def download_media(self, target, file, *, thumb):
+                type(self).downloads += 1
+                return image_bytes
+
+        client = Client()
+
+        async def with_client(handler):
+            return await handler(client)
+
+        with (
+            patch.object(MODULE, "_binding", return_value=object()),
+            patch.object(MODULE, "_provider_context", return_value=("Me", "/profile")),
+            patch.object(MODULE, "_with_client", side_effect=with_client),
+            patch.object(MODULE, "_run_async", side_effect=asyncio.run),
+        ):
+            result = MODULE.messages(
+                SimpleNamespace(query_params={}), scope="budget-scope", peer="@testgroup", limit=20, topicId=0,
+            )
+
+        items = result["messages"]
+        previews = [item.get("mediaPreview") for item in items]
+        self.assertGreater(
+            sum(1 for p in previews if p is not None), 6,
+            "more than six image posts must carry previews (old count cap)",
+        )
+        total = sum(len(p) for p in previews if p is not None)
+        self.assertLessEqual(total, MODULE._MAX_MEDIA_PREVIEW_PAGE_BYTES)
+        self.assertEqual(client.downloads, 20, "every image post downloads once")
+
     def test_media_preview_cache_ttl_and_lru_bound(self):
         MODULE._media_previews.clear()
         uri = "data:image/png;base64,AA"
