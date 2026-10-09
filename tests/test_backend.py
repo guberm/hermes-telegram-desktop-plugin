@@ -967,6 +967,11 @@ class SaveActionTests(unittest.TestCase):
         self.forwards = []
 
         class Client:
+            _self_id = 1
+            saved_dialogs = None
+            _dialogs_calls = 0
+            get_dialogs = None  # type: ignore[assignment]
+
             async def get_entity(inner, peer):
                 return self.entity
 
@@ -1037,6 +1042,73 @@ class SaveActionTests(unittest.TestCase):
             ))
         self.assertEqual(raised.exception.status_code, 404)
         self.assertEqual(self.forwards, [], "no ticket, no forward")
+
+    def test_verify_ignores_forward_header_mismatch(self):
+        # Regression: the readback used to require forward.id == source
+        # messageId, but forward.id is the ORIGINAL SENDER's user id, so a
+        # successful save always tripped the check and surfaced as 502
+        # "outcome is uncertain" after the message was already stored. The
+        # commit already proves the forward landed; the readback only has to
+        # prove the message still exists. Pin the readback to a message whose
+        # forward header points at a different user id than the source
+        # message — the old check would have raised "readback mismatch".
+        mismatch = SimpleNamespace(id=777, message="keep me",
+                                   fwd_from=SimpleNamespace(from_id=42))
+        self.saved = mismatch
+        # Keep the readback pinned: setUp's forward mock would otherwise
+        # replace self.saved with its own (matching) message.
+        async def forward_no_side_effect(dest, messages, from_peer=None):
+            self.forwards.append((dest, messages, from_peer))
+            return [SimpleNamespace(id=777)]
+
+        self.client.forward_messages = forward_no_side_effect
+
+        prepared = MODULE.prepare_action(self.request, MODULE.SavePrepare(
+            scope=self.scope, action="save", peer="@group", messageId=321,
+        ))
+        result = MODULE.commit_action(self.request, MODULE.CommitRequest(
+            scope=self.scope, confirmationToken=prepared["confirmationToken"], confirmed=True,
+        ))
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["id"], 777)
+        self.assertEqual(self.forwards, [("me", [321], self.entity)])
+
+    def test_verify_falls_back_to_dialogs_snapshot(self):
+        # When the direct fetch comes back empty (MessagesNotModified for a
+        # cached entry), the dialogs snapshot's Saved Messages dialog must
+        # confirm the message.
+        saved = make_message(777, "keep me")
+        self.client._self_id = 1
+        # Dialog must match what get_entity(self) resolves to (setUp's mock
+        # returns the same group entity for every peer).
+        self.client.saved_dialogs = [  # type: ignore[assignment]
+            SimpleNamespace(id=self.entity.id, entity=self.entity, message=saved),
+        ]
+        self.client._dialogs_calls = 0
+
+        async def get_dialogs(limit):
+            self.client._dialogs_calls += 1
+            return self.client.saved_dialogs
+
+        self.client.get_dialogs = get_dialogs  # type: ignore[assignment]
+        # Pin the direct fetch to miss: the setUp forward mock would otherwise
+        # repopulate self.saved during commit, hiding the fallback path.
+        async def get_messages_miss(entity, ids):
+            if ids == 777:
+                return None
+            return self.target if ids == 321 else None
+
+        self.client.get_messages = get_messages_miss  # type: ignore[assignment]
+
+        prepared = MODULE.prepare_action(self.request, MODULE.SavePrepare(
+            scope=self.scope, action="save", peer="@group", messageId=321,
+        ))
+        result = MODULE.commit_action(self.request, MODULE.CommitRequest(
+            scope=self.scope, confirmationToken=prepared["confirmationToken"], confirmed=True,
+        ))
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["id"], 777)
+        self.assertEqual(self.client._dialogs_calls, 1, "fallback must fetch dialogs once")
 
 
 class ForumTopicsRouteTests(unittest.TestCase):

@@ -1502,9 +1502,34 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
                 result["topicId"] = topic_id
             return result
         if action == "save":
+            # The commit already proves the forward landed: ForwardMessages
+            # returned a new message id in Saved Messages. The readback must
+            # only prove the message is still THERE — it must not re-derive
+            # "what was forwarded from" off the read: `forward.id` is the
+            # ORIGINAL SENDER's user id from the source message, so comparing
+            # it to the source message id can never hold and turned every
+            # successful save into a false 502. Keep the header in the log
+            # for diagnostics, and fall back to the dialogs readback if the
+            # direct fetch comes back empty (MessagesNotModified on a
+            # previously-cached entry).
             saved = await client.get_messages("me", ids=outcome["sentId"])
-            if saved is None or int(getattr(getattr(saved, "forward", None), "id", 0) or 0) != int(payload["messageId"]):
-                raise ValueError("saved message readback mismatch")
+            if saved is None:
+                # The message may be cached server-side as not-modified; the
+                # dialogs snapshot carries the live top message of each chat.
+                me_entity = await client.get_entity(client._self_id)
+                dialogs = await client.get_dialogs(limit=200)
+                saved_dialog = next((d for d in dialogs if _dialog_match(d, me_entity)), None)
+                saved = getattr(saved_dialog, "message", None)
+                if saved is not None and int(getattr(saved, "id", 0) or 0) != int(outcome["sentId"]):
+                    saved = None
+            header = getattr(saved, "fwd_from", None)
+            logger.info(
+                "save readback sentId=%s found=%s forwardFrom=%s forwardDate=%s",
+                outcome["sentId"], saved is not None,
+                getattr(header, "from_id", None), getattr(header, "date", None),
+            )
+            if saved is None:
+                raise ValueError("saved message not found on readback")
             return {"status": "verified", "id": int(saved.id), "peer": name}
         # delete
         message = await client.get_messages(entity, ids=payload["messageId"])
