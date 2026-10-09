@@ -1,67 +1,68 @@
 # Hermes Desktop Telegram plugin
 
-Один unified-пакет: Telegram-клиент для Hermes Desktop (UI), профиль-скоупед
-dashboard backend и декларация агента. Пакет profile-safe: не содержит
-OAuth-секретов, api_id/api_hash или файлов сессии — backend резолвит
-авторизованную Telethon-сессию активного профиля на каждый запрос.
+One unified package: a Telegram client for Hermes Desktop (UI), a
+profile-scoped dashboard backend, and an agent declaration. The package is
+profile-safe: it contains no OAuth secrets, api_id/api_hash, or session
+files — the backend resolves the active profile's authorized Telethon
+session on every request.
 
 ## Layout
 
-- `plugins/telegram/plugin.yaml` + `__init__.py` — декларация агента (inert).
+- `plugins/telegram/plugin.yaml` + `__init__.py` — agent declaration (inert).
 - `plugins/telegram/desktop/plugin.js` — Hermes Desktop runtime plugin
-  (materialized в `~/.hermes/desktop-plugins/telegram/`, sidebars `/telegram`).
+  (materialized into `~/.hermes/desktop-plugins/telegram/`, sidebar `/telegram`).
 - `plugins/telegram/dashboard/manifest.json` + `plugin_api.py` — backend,
-  монтируется на `/api/plugins/telegram/`.
-- `tests/` — офлайн-тесты backend, контрактов пакета и ESM-модуля.
+  mounted on `/api/plugins/telegram/`.
+- `tests/` — offline tests for the backend, package contracts, and the ESM module.
 
 ## Install
 
-1. `plugins/telegram/` — целиком под `~/.hermes/plugins/telegram/` (или
-   profile-локально под `~/.hermes/profiles/<name>/plugins/telegram/`).
-2. Добавить `telegram` в `plugins.enabled` активного профиля (trust gate
-   для dashboard backend, отдельный от переключателя в Desktop UI).
-3. **Runtime-зависимость**: desktop/dashboard-бэкенд Hermes исполняет
-   `plugin_api.py` в своём pm-окружении (например
-   `~/.hermes/installs/<id>/environments/<env>/venv`). Telethon должен быть
-   установлен именно туда, иначе роуты смонтируются, но каждый запрос вернёт
-   502 «backend unavailable»:
+1. Copy `plugins/telegram/` as a whole to `~/.hermes/plugins/telegram/` (or
+   profile-locally to `~/.hermes/profiles/<name>/plugins/telegram/`).
+2. Add `telegram` to `plugins.enabled` of the active profile (the trust gate
+   for the dashboard backend, separate from the Desktop UI toggle).
+3. **Runtime dependency**: the Hermes desktop/dashboard backend executes
+   `plugin_api.py` in its own env (e.g.
+   `~/.hermes/installs/<id>/environments/<env>/venv`). Telethon must be
+   installed into exactly that env, otherwise the routes mount but every
+   request returns 502 "backend unavailable":
    ```
    uv pip install --python ~/.hermes/installs/<id>/environments/<env>/venv/bin/python telethon
    ```
-4. Desktop сам materializes `desktop/plugin.js` в `~/.hermes/desktop-plugins/telegram/`
-   при старте — вручную копировать не нужно.
-5. Перезапустить/перечитать плагины: ⌘K → **Reload desktop plugins**;
-   в боковой панели появится строка **Telegram**, маршрут `/telegram`.
+4. Desktop materializes `desktop/plugin.js` into `~/.hermes/desktop-plugins/telegram/`
+   on start by itself — no manual copy needed.
+5. Restart/reload plugins: ⌘K → **Reload desktop plugins**;
+   a **Telegram** row appears in the sidebar, route `/telegram`.
 
-При неавторизованной отдельной сессии в самой странице отображается login panel:
-вход телефоном (код, затем при наличии 2FA-пароль) или QR. QR-кодер включён
-в `desktop/plugin.js` inline, потому что Desktop runtime разрешает импорты только
-`@hermes/plugin-sdk` и `react`. Embedded encoder — `qrcode@1.5.4` (MIT), текст
-лицензии: `LICENSES/qrcode-MIT.txt`.
+With an unauthorized dedicated session, the page itself shows a login panel:
+phone login (code, then the 2FA password if configured) or QR. The QR encoder
+is inlined in `desktop/plugin.js` because the Desktop runtime only allows
+imports from `@hermes/plugin-sdk` and `react`. Embedded encoder —
+`qrcode@1.5.4` (MIT); license text: `LICENSES/qrcode-MIT.txt`.
 
-`api_id` и `api_hash` берутся из `~/.hermes/rss_reader/config.json` активного
-профиля; `session_path` из этого файла не используется. Login flow и все
-plugin API calls используют только выделенную сессию
+`api_id` and `api_hash` are read from the active profile's
+`~/.hermes/rss_reader/config.json`; `session_path` from that file is not
+used. The login flow and all plugin API calls use only the dedicated session
 `~/.hermes/telegram-plugin-auth/telegram-plugin-auth.session`. Phone-code/QR
-challenge values держатся только в памяти процесса, а служебное состояние
-записывается с правами `0600`; успешная сессия остаётся в отдельном Telethon
-файле. Отсутствующая/неавторизованная выделенная сессия приводит к fail-closed
-ошибке, без fallback на RSS reader.
+challenge values are held in process memory only, and service state is
+written with `0600` permissions; a successful session remains in a separate
+Telethon file. A missing/unauthorized dedicated session fails closed with an
+error — no fallback to the RSS reader.
 
 ## Safety
 
-- Чтение диалогов и истории — read-only. Вся история приходит с бэкенда
-  санитизированной (Python HTMLParser: allowlist тегов, экранированный текст,
-  только https-ссылки) и рендерится через React-элементы.
-- Каждая мутация — **prepare → точный preview (JSON) → явный Confirm →
-  commit → readback-проверка результата**. Тикет живёт 5 минут,
-  привязан к scope и аккуанту, и требует `confirmed: true` (строго bool).
-- Delete — обычное удаление выбранного сообщения (массовых/безвозвратных
-  операций нет); подтверждение обязательно.
-- Read state (mark-read) — только по явному Confirm; readback сверяет
+- Reading dialogs and history is read-only. All history arrives sanitized
+  from the backend (Python HTMLParser: tag allowlist, escaped text, https
+  links only) and is rendered through React elements.
+- Every mutation — **prepare → exact preview (JSON) → explicit Confirm →
+  commit → readback verification of the result**. A ticket lives 5 minutes,
+  is bound to scope and account, and requires `confirmed: true` (strict bool).
+- Delete — ordinary deletion of the selected message (no bulk/irreversible
+  operations); confirmation is mandatory.
+- Read state (mark-as-read) — only on explicit Confirm; the readback checks
   unread == 0.
-- Отправка: точный preview (peer + текст), после commit — readback текста
-  и reply-линковки.
+- Sending: exact preview (peer + text), after commit — readback of the text
+  and the reply link.
 
 ## Checks
 
@@ -71,5 +72,5 @@ node --test tests/*.mjs
 HERMES_SOURCE=~/.hermes/hermes-agent python -m py_compile plugins/telegram/dashboard/plugin_api.py plugins/telegram/__init__.py
 ```
 
-HTTP-роуты требуют живого рантайма; офлайн-тесты не делают сетевых вызовов
-и не трогают живую сессию Telegram.
+HTTP routes require a live runtime; the offline tests make no network calls
+and do not touch the live Telegram session.
