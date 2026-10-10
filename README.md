@@ -30,9 +30,10 @@ With an unauthorized dedicated session, the page itself shows a login panel:
 phone login (code, then the 2FA password if configured) or QR. The backend
 builds the QR matrix; the Desktop pane only paints it.
 
-`TELEGRAM_API_ID` and `TELEGRAM_API_HASH` environment variables take precedence;
-`api_id` and `api_hash` in the active profile's `~/.hermes/rss_reader/config.json`
-remain a compatibility fallback. `session_path` from that file is not used. The login flow and all plugin API calls use only the dedicated session
+`TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are read through the profile's Hermes
+secrets (`agent.secret_scope.get_secret`, so the dashboard route's profile
+scope and a single-profile `.env` both work). No other plugin's or tool's
+config file is consulted. The login flow and all plugin API calls use only the dedicated session
 `~/.hermes/telegram-plugin-auth/telegram-plugin-auth.session`. Phone-code/QR
 challenge values are held in process memory only, the auth state file and the
 Telethon session artifacts (`.session`, plus SQLite's `-wal`/`-shm` sidecars)

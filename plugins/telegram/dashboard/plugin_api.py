@@ -338,25 +338,29 @@ def _current_home() -> str:
 
 
 def _load_telegram_credentials() -> tuple[int, str]:
-    api_id, api_hash = os.getenv("TELEGRAM_API_ID"), os.getenv("TELEGRAM_API_HASH")
-    if api_id and api_hash:
-        try:
-            parsed_id = int(api_id)
-        except ValueError:
-            parsed_id = 0
-        if parsed_id > 0:
-            return parsed_id, api_hash
-    path = Path(_current_home()) / "rss_reader" / "config.json"
+    """Read the Telethon api_id/api_hash from the active profile's Hermes secrets.
+
+    ``agent.secret_scope.get_secret`` honors the profile secret scope the
+    dashboard route already runs inside (and falls through to the process env
+    for single-profile deployments). Another plugin's config file is never
+    consulted: a miss fails closed as a configuration error.
+    """
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        from agent.secret_scope import get_secret
+
+        api_id = get_secret("TELEGRAM_API_ID")
+        api_hash = get_secret("TELEGRAM_API_HASH")
+    except Exception:
+        # Import unavailable, or multiplexing with no profile scope installed —
+        # fail closed instead of reading a possibly-foreign os.environ value.
         raise _AuthUnavailable("missing Telegram API configuration") from None
-    if not isinstance(config, dict):
-        raise _AuthUnavailable("invalid Telegram API configuration")
-    api_id, api_hash = config.get("api_id"), config.get("api_hash")
-    if isinstance(api_id, int) and api_id > 0 and isinstance(api_hash, str) and api_hash:
-        return api_id, api_hash
-    raise _AuthUnavailable("incomplete Telegram API configuration")
+    try:
+        parsed_id = int(api_id) if api_id else 0
+    except (TypeError, ValueError):
+        parsed_id = 0
+    if parsed_id > 0 and isinstance(api_hash, str) and api_hash:
+        return parsed_id, api_hash
+    raise _AuthUnavailable("missing Telegram API configuration")
 
 
 def _dedicated_session_path() -> Path:

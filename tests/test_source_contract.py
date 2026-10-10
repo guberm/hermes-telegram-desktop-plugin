@@ -32,7 +32,12 @@ class ShippedSourceContractTests(unittest.TestCase):
         self.assertEqual(imports, [])
 
     def test_session_resolves_at_request_time_and_never_persists_secrets(self):
-        self.assertIn('"rss_reader" / "config.json"', self.backend_text)
+        # Credentials come from the profile's Hermes secret scope; another
+        # plugin's config file (the RSS reader's) must never be read.
+        self.assertIn("agent.secret_scope", self.backend_text)
+        self.assertIn('get_secret("TELEGRAM_API_ID")', self.backend_text)
+        self.assertIn('get_secret("TELEGRAM_API_HASH")', self.backend_text)
+        self.assertNotIn("rss_reader", self.backend_text)
         self.assertIn('"telegram-plugin-auth"', self.backend_text)
         self.assertIn("_dedicated_session_path()", self.backend_text)
         self.assertIn("_telegram_manager()", self.backend_text)

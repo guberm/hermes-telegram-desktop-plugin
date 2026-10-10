@@ -153,6 +153,32 @@ class DedicatedSessionTests(unittest.TestCase):
             self.assertIs(MODULE._telegram_manager(), manager)
         self.assertEqual(manager.client.values[:3], ("/dedicated/plugin-auth", 123, "api-hash"))
 
+    def test_credentials_come_from_the_profile_secret_scope(self):
+        calls: list[str] = []
+
+        def fake_get_secret(name, default=None):
+            calls.append(name)
+            return {"TELEGRAM_API_ID": "123", "TELEGRAM_API_HASH": "api-hash"}.get(name)
+
+        stub = ModuleType("agent.secret_scope")
+        stub.get_secret = fake_get_secret
+        with patch.dict(sys.modules, {"agent.secret_scope": stub}):
+            self.assertEqual(MODULE._load_telegram_credentials(), (123, "api-hash"))
+        self.assertEqual(calls, ["TELEGRAM_API_ID", "TELEGRAM_API_HASH"])
+
+    def test_credentials_never_fall_back_to_another_plugins_config(self):
+        stub = ModuleType("agent.secret_scope")
+        stub.get_secret = lambda name, default=None: None
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "rss_reader").mkdir()
+            (Path(temp) / "rss_reader" / "config.json").write_text(
+                json.dumps({"api_id": 999, "api_hash": "rss-hash"}), encoding="utf-8"
+            )
+            with patch.dict(sys.modules, {"agent.secret_scope": stub}):
+                with patch.object(MODULE, "_current_home", return_value=temp):
+                    with self.assertRaises(MODULE._AuthUnavailable):
+                        MODULE._load_telegram_credentials()
+
     def test_auth_state_never_persists_codes_or_pending_tokens(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "auth_state.json"
