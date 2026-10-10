@@ -524,5 +524,51 @@ class TelethonQrHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(qr.token, b"fresh")
 
 
+class AuthRouteErrorMappingTests(unittest.TestCase):
+    """The route classifier must not collapse every failure into one opaque 502."""
+
+    def _route_result(self, error: BaseException):
+        """Run one auth route whose operation raises *error*; return the HTTPException."""
+        async def failing() -> None:
+            raise error
+
+        class StubManager:
+            def run(self, coro, *, timeout=90.0):
+                return asyncio.run(coro)
+
+        token = auth._ACTIVE_SESSION_KEY.set("/tmp/route-test/session")
+        try:
+            with patch.object(auth, "_manager", return_value=StubManager()):
+                with self.assertRaises(Exception) as raised:
+                    auth._route(failing())
+        finally:
+            auth._ACTIVE_SESSION_KEY.reset(token)
+        return raised.exception
+
+    def test_configuration_unavailable_is_reported_as_a_config_problem(self):
+        api = sys.modules[API_NAME]
+        with self.assertLogs("hermes.telegram_desktop", level="WARNING"):
+            exc = self._route_result(api._AuthUnavailable("missing Telegram API configuration"))
+        self.assertEqual(exc.status_code, 409)
+        self.assertEqual(exc.detail, "missing Telegram API configuration")
+
+    def test_transport_failure_is_retryable_not_opaque(self):
+        with self.assertLogs("hermes.telegram_desktop", level="WARNING"):
+            exc = self._route_result(TimeoutError("Telegram request exceeded the bounded operation time"))
+        self.assertEqual(exc.status_code, 503)
+        self.assertIn("retry", str(exc.detail).lower())
+
+    def test_unexpected_failure_stays_generic_and_logs_no_secret(self):
+        secret = "api_hash=SUPERSECRET"
+        with self.assertLogs("hermes.telegram_desktop", level="WARNING") as captured:
+            exc = self._route_result(RuntimeError(secret))
+        self.assertEqual(exc.status_code, 502)
+        self.assertEqual(exc.detail, "Telegram auth step failed.")
+        self.assertNotIn("SUPERSECRET", str(exc.detail))
+        logged = "\n".join(captured.output)
+        self.assertNotIn("SUPERSECRET", logged)
+        self.assertIn("RuntimeError", logged)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ import base64
 import contextvars
 import importlib.util
 import json
+import logging
 import sys
 import threading
 import time
@@ -17,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
 router = APIRouter()
+log = logging.getLogger("hermes.telegram_desktop")
 _LOCK = threading.RLock()
 _VOLATILE_STATE: dict[str, dict[str, Any]] = {}
 _QR_TASK: dict[str, asyncio.Task[Any]] = {}
@@ -191,8 +193,21 @@ def _run(coro: Any, *, timeout: float = 90.0) -> Any:
     return _manager().run(coro, timeout=timeout)
 
 
+def _config_unavailable_types() -> Any:
+    """The sibling api module's config/session-unavailable error, resolved lazily.
+
+    Returns an empty tuple when it cannot be resolved, so the ``except`` clause
+    then simply matches nothing instead of masking the original failure.
+    """
+    try:
+        return getattr(_api_module(), "_AuthUnavailable", ())
+    except Exception:
+        return ()
+
+
 def _route(coro: Any, *, timeout: float = 90.0) -> Any:
     profile_key = _profile_key()
+    operation = getattr(getattr(coro, "cr_code", None), "co_name", "auth")
 
     async def run_scoped() -> Any:
         token = _ACTIVE_SESSION_KEY.set(profile_key)
@@ -207,12 +222,25 @@ def _route(coro: Any, *, timeout: float = 90.0) -> Any:
         raise HTTPException(status_code=429, detail={"message": "Telegram rate limit.", "retryAfter": exc.seconds}) from None
     except _AuthFlowError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
+    except _config_unavailable_types() as exc:
+        # A safe, plugin-authored static message (missing/unauthorized Telegram
+        # API configuration or session) — report it as a configuration problem
+        # instead of an opaque upstream failure.
+        log.warning("telegram auth op=%s unavailable: %s", operation, type(exc).__name__)
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except (TimeoutError, ConnectionError, OSError) as exc:
+        # Network/transport trouble reaching Telegram (or the bounded operation
+        # window) is retryable, not a mysterious server fault.
+        log.warning("telegram auth op=%s transport failure: %s", operation, type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Telegram could not be reached; retry in a moment.") from None
     except Exception as exc:
         # Typed public errors are mapped below; never leak Telegram RPC payloads,
-        # challenge material, or raw exception strings through the API.
+        # challenge material, or raw exception strings through the API. The log
+        # line carries only the operation and the exception class.
         wait = getattr(exc, "seconds", None)
         if type(exc).__name__ == "FloodWaitError" and wait is not None:
             raise HTTPException(status_code=429, detail={"message": "Telegram rate limit.", "retryAfter": int(wait)}) from None
+        log.warning("telegram auth op=%s failed: %s", operation, type(exc).__name__)
         raise HTTPException(status_code=502, detail="Telegram auth step failed.") from None
 
 
