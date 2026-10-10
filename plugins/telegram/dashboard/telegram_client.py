@@ -98,9 +98,19 @@ class TelegramClientManager:
                               auto_reconnect=True, connection_retries=3, request_retries=3,
                               flood_sleep_threshold=0)
         await self.client.connect()
-        if self.session_path.exists():
+        self.harden_session_permissions()
+
+    def harden_session_permissions(self) -> None:
+        """Restrict the Telethon session artifacts to their owner.
+
+        Telethon appends ``.session`` to the path it is given, so chmod-ing the
+        bare ``session_path`` leaves the real file (plus SQLite's ``-wal`` /
+        ``-shm`` sidecars) at the umask default.
+        """
+        base = f"{self.session_path}.session"
+        for candidate in (base, f"{base}-wal", f"{base}-shm"):
             try:
-                self.session_path.chmod(0o600)
+                os.chmod(candidate, 0o600)
             except OSError:
                 pass
 
@@ -152,6 +162,7 @@ class TelegramClientManager:
                               auto_reconnect=True, connection_retries=3, request_retries=3,
                               flood_sleep_threshold=0)
         await self.client.connect()
+        self.harden_session_permissions()
 
     def submit(self, coroutine: Any) -> Any:
         """Schedule an independent owner-loop coroutine (e.g. QR waiter)."""

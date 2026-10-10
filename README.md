@@ -10,15 +10,15 @@ session on every request.
 
 - `plugins/telegram/plugin.yaml` + `__init__.py` — agent declaration (inert).
 - `plugins/telegram/desktop/plugin.js` — Hermes Desktop runtime plugin
-  (materialized into `~/.hermes/desktop-plugins/telegram/`, sidebar `/telegram`).
+  (materialized into `~/.hermes/desktop-plugins/telegram-client/`, sidebar route `/telegram-client`).
 - `plugins/telegram/dashboard/manifest.json` + `plugin_api.py` — backend,
-  mounted on `/api/plugins/telegram/`.
+  mounted on `/api/plugins/telegram-client/`.
 - `tests/` — offline tests for the backend, package contracts, and the ESM module.
 
 ## Install
 
-1. Copy `plugins/telegram/` as a whole to `~/.hermes/plugins/telegram/` (or
-   profile-locally to `~/.hermes/profiles/<name>/plugins/telegram/`).
+1. Copy `plugins/telegram/` as a whole to `~/.hermes/plugins/telegram-client/` (or
+   profile-locally to `~/.hermes/profiles/<name>/plugins/telegram-client/`).
 2. Add `telegram-client` to `plugins.enabled` of the active profile (the trust gate
    for the dashboard backend, separate from the Desktop UI toggle).
 3. Desktop materializes `desktop/plugin.js` into `~/.hermes/desktop-plugins/telegram-client/`
@@ -34,8 +34,9 @@ builds the QR matrix; the Desktop pane only paints it.
 `api_id` and `api_hash` in the active profile's `~/.hermes/rss_reader/config.json`
 remain a compatibility fallback. `session_path` from that file is not used. The login flow and all plugin API calls use only the dedicated session
 `~/.hermes/telegram-plugin-auth/telegram-plugin-auth.session`. Phone-code/QR
-challenge values are held in process memory only, and service state is
-written with `0600` permissions; a successful session remains in a separate
+challenge values are held in process memory only, the auth state file and the
+Telethon session artifacts (`.session`, plus SQLite's `-wal`/`-shm` sidecars)
+are restricted to `0600`; a successful session remains in a separate
 Telethon file. A missing/unauthorized dedicated session fails closed with an
 error — no fallback to the RSS reader.
 

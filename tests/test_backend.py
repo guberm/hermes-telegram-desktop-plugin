@@ -172,6 +172,22 @@ class DedicatedSessionTests(unittest.TestCase):
                 AUTH._write_state({"stage": "done", "phone": "+15551234567"})
                 self.assertEqual(AUTH._VOLATILE_STATE, {})
 
+    def test_session_file_is_restricted_to_its_owner(self):
+        spec = importlib.util.spec_from_file_location(
+            "hermes_dashboard_plugin_telegram_client",
+            ROOT / "plugins/telegram/dashboard/telegram_client.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temp:
+            bare = Path(temp) / "telegram-plugin-auth"
+            session = Path(f"{bare}.session")
+            session.write_bytes(b"session")
+            session.chmod(0o644)
+            manager = module.TelegramClientManager(bare, lambda: (1, "hash"))
+            manager.harden_session_permissions()
+            self.assertEqual(session.stat().st_mode & 0o777, 0o600)
+
 
 class DialogFolderTests(unittest.TestCase):
     def test_dialog_page_filters_backend_folder_before_applying_limit(self):

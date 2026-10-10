@@ -1374,13 +1374,14 @@ def commit_action(request: Request, body: CommitRequest) -> dict[str, Any]:
     async def _mutate(client: Any) -> dict[str, Any]:
         entity, name = await _peer_out(client, payload["peer"])
         if action == "send":
-            sent = await client.send_message(entity, payload["message"])
+            sent = await client.send_message(entity, payload["message"], parse_mode=None)
             return {"sentId": int(sent.id), "peer": name}
         if action == "reply":
             sent = await client.send_message(
                 entity,
                 payload["message"],
                 reply_to=payload["messageId"],
+                parse_mode=None,
             )
             return {"sentId": int(sent.id), "peer": name}
         if action == "mark-read":
