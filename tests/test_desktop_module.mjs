@@ -168,9 +168,11 @@ function makeTelegramPane(dialogs, messages = []) {
 test('settings default to manual refresh', () => {
   const load = loadFunction('loadSettings', 'unreadBadge', defaults)
   assert.deepEqual(load({ get: () => null }, 'k'), { autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
-  // autoRefresh is a period in ms (30000/60000) or false; legacy true maps to 60s.
+  // autoRefresh is a period in ms (15000/30000/60000) or false; legacy true maps to 60s.
   assert.deepEqual(load({ get: () => ({ autoRefresh: true, unmutedOnly: true, unreadOnly: true, tab: '42', junk: 1 }) }, 'k'),
     { autoRefresh: 60000, unmutedOnly: true, unreadOnly: true, confirmActions: true, tab: '42' })
+  assert.deepEqual(load({ get: () => ({ autoRefresh: 15000 }) }, 'k'),
+    { autoRefresh: 15000, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
   assert.deepEqual(load({ get: () => ({ autoRefresh: 30000 }) }, 'k'),
     { autoRefresh: 30000, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: 'all' })
   assert.deepEqual(load({ get: () => ({ autoRefresh: 'yes', tab: 'nope' }) }, 'k'),
@@ -554,4 +556,81 @@ test('context copy marks data as untrusted', () => {
   const text = context('me', { id: 1, text: 'hi' })
   assert.match(text, /UNTRUSTED TELEGRAM DATA/)
   assert.match(text, /"source": "telegram"/)
+})
+
+test('auto-refresh cycles off → 15s → 30s → 60s → off', () => {
+  const render = makeTelegramPane(
+    [{ key: '@alice', name: 'Alice', muted: false, unread: 0, topMessageId: 42, folderIds: ['all'] }],
+    [],
+  )
+  const treeNodes = tree => Array.isArray(tree) ? tree.flatMap(treeNodes)
+    : tree && typeof tree === 'object' ? [tree, ...treeNodes(tree.props?.children)] : []
+  const state = tree => treeNodes(tree).find(node => node.props?.['data-testid'] === 'auto-refresh-state')?.props?.children
+  const cycle = tree => treeNodes(tree).find(node => node.type === 'button'
+    && typeof node.props.children === 'string' && node.props.children.startsWith('Auto-refresh:'))
+  let tree = render()
+  assert.equal(state(tree), 'auto: off')
+  assert.equal(cycle(tree).props.children, 'Auto-refresh: 15s')
+  cycle(tree).props.onClick()
+  tree = render()
+  assert.equal(state(tree), 'auto: 15s')
+  assert.equal(cycle(tree).props.children, 'Auto-refresh: 30s')
+  cycle(tree).props.onClick()
+  tree = render()
+  assert.equal(state(tree), 'auto: 30s')
+  cycle(tree).props.onClick()
+  tree = render()
+  assert.equal(state(tree), 'auto: 60s')
+  assert.equal(cycle(tree).props.children, 'Auto-refresh: off')
+  cycle(tree).props.onClick()
+  tree = render()
+  assert.equal(state(tree), 'auto: off')
+})
+
+test('right-click on a post offers Mark as read and Open in browser', async () => {
+  const render = makeTelegramPane(
+    [{ key: '@alice', name: 'Alice', muted: false, unread: 0, topMessageId: 42, folderIds: ['all'] }],
+    [{ id: 15, date: '2026-10-07T10:00:00Z', mine: false, sender: 'Bob', htmlPreview: 'hello', media: '', replyTo: null }],
+  )
+  const treeNodes = tree => Array.isArray(tree) ? tree.flatMap(treeNodes)
+    : tree && typeof tree === 'object' ? [tree, ...treeNodes(tree.props?.children)] : []
+  let tree = render()
+  treeNodes(tree).find(node => node.type === 'button' && Array.isArray(node.props.children)
+    && node.props.children[0]?.props?.children === 'Alice').props.onClick()
+  tree = render()
+  const article = treeNodes(tree).find(node => node.type === 'article')
+  assert.ok(article?.props?.onContextMenu, 'a post exposes a right-click handler')
+  article.props.onContextMenu({ preventDefault() {}, clientX: 12, clientY: 34 })
+  tree = render()
+  const menu = treeNodes(tree).find(node => node.type === 'div' && node.props.role === 'menu')
+  assert.ok(menu, 'the right-click menu is rendered')
+  assert.equal(menu.props.style.position, 'fixed')
+  assert.equal(menu.props.style.top, 34)
+  assert.equal(menu.props.style.left, 12)
+  assert.deepEqual(menu.props.children.filter(Boolean).map(entry => entry.props.children),
+    ['Mark as read', 'Open in browser'])
+  const open = menu.props.children.find(entry => entry?.props?.children === 'Open in browser')
+  await open.props.onClick()
+  assert.deepEqual(tree.opened, ['https://t.me/alice/15'])
+})
+
+test('right-click Mark as read stages the same scoped read action', async () => {
+  const render = makeTelegramPane(
+    [{ key: '@alice', name: 'Alice', muted: false, unread: 3, topMessageId: 42, folderIds: ['all'] }],
+    [{ id: 15, date: '2026-10-07T10:00:00Z', mine: false, sender: 'Bob', htmlPreview: 'hello', media: '', replyTo: null }],
+  )
+  const treeNodes = tree => Array.isArray(tree) ? tree.flatMap(treeNodes)
+    : tree && typeof tree === 'object' ? [tree, ...treeNodes(tree.props?.children)] : []
+  let tree = render()
+  treeNodes(tree).find(node => node.type === 'button' && Array.isArray(node.props.children)
+    && node.props.children[0]?.props?.children === 'Alice').props.onClick()
+  tree = render()
+  treeNodes(tree).find(node => node.type === 'article').props.onContextMenu({ preventDefault() {}, clientX: 4, clientY: 5 })
+  tree = render()
+  const menu = treeNodes(tree).find(node => node.type === 'div' && node.props.role === 'menu')
+  const mark = menu.props.children.find(entry => entry?.props?.children === 'Mark as read')
+  mark.props.onClick()
+  await Promise.resolve()
+  assert.deepEqual(render.restCalls().map(call => call.path), ['/actions/prepare'])
+  assert.deepEqual(render.restCalls()[0].options.body.messageId ?? render.restCalls()[0].options.body.maxId, 15)
 })

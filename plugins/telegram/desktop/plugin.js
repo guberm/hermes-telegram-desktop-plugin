@@ -483,7 +483,7 @@ export function loadSettings(storage, key) {
     const raw = storage.get(key, null)
     if (!raw || typeof raw !== 'object') return { ...DEFAULT_SETTINGS }
     return {
-      autoRefresh: raw.autoRefresh === 30000 || raw.autoRefresh === 60000 ? raw.autoRefresh : raw.autoRefresh === true ? 60000 : false,
+      autoRefresh: raw.autoRefresh === 15000 || raw.autoRefresh === 30000 || raw.autoRefresh === 60000 ? raw.autoRefresh : raw.autoRefresh === true ? 60000 : false,
       unmutedOnly: raw.unmutedOnly === true,
       unreadOnly: raw.unreadOnly === true,
       confirmActions: raw.confirmActions !== false,
@@ -574,6 +574,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
   const [busy, setBusy] = useState(false)
   const [compose, setCompose] = useState(null) // null | { peer, messageId?, message }
   const [hiddenMessageIds, setHiddenMessageIds] = useState(() => new Set())
+  const [postMenu, setPostMenu] = useState(null)
   const guard = useRef(false)
   const mounted = useRef(true)
   useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
@@ -686,6 +687,14 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
   }
 
   const waiting = busy || mutation.isPending
+
+  // The per-post context menu closes on Escape; clicking an entry closes it too.
+  useEffect(() => {
+    if (!postMenu) return undefined
+    const onKeyDown = event => { if (event.key === 'Escape') setPostMenu(null) }
+    globalThis.addEventListener?.('keydown', onKeyDown)
+    return () => globalThis.removeEventListener?.('keydown', onKeyDown)
+  }, [postMenu])
   const folders = Array.isArray(dialogsQuery.data?.folders) ? dialogsQuery.data.folders : [{ id: 'all', title: 'All' }]
   const selectedTab = folders.some(item => item.id === folder) ? folder : 'all'
   const folderTabs = selectedTab === folder ? folders : [{ id: 'all', title: 'All' }, ...folders.filter(item => item.id !== 'all')]
@@ -759,13 +768,17 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
       jsxs('div', { style: { ...row, justifyContent: 'space-between', flexWrap: 'wrap', minWidth: 0 }, children: [
         jsx('strong', { children: `Telegram — ${me}` }),
         jsxs('div', { style: { ...row, flexWrap: 'wrap' }, children: [
-        // Auto-refresh period: Off / 30s / 60s. Clicking the button cycles to
-        // the next period; the label always shows the active one.
+        // Auto-refresh period: Off / 15s / 30s / 60s. Clicking the button cycles
+        // to the next period; the label always shows the active one.
         jsx('span', { 'data-testid': 'auto-refresh-state', style: { ...muted, fontSize: '0.8rem', whiteSpace: 'nowrap' },
           children: settings.autoRefresh === false ? 'auto: off' : `auto: ${settings.autoRefresh / 1000}s` }),
-        action(settings.autoRefresh === false ? 'Auto-refresh: 30s' : settings.autoRefresh === 30000 ? 'Auto-refresh: 60s' : 'Auto-refresh: off', () => {
-          setSettings(current => ({ ...current, autoRefresh: current.autoRefresh === false ? 30000 : current.autoRefresh === 30000 ? 60000 : false }))
-        }, false, { title: 'Cycle auto-refresh period: off / 30s / 60s' }),
+        action(settings.autoRefresh === false ? 'Auto-refresh: 15s'
+          : settings.autoRefresh === 15000 ? 'Auto-refresh: 30s'
+            : settings.autoRefresh === 30000 ? 'Auto-refresh: 60s' : 'Auto-refresh: off', () => {
+          setSettings(current => ({ ...current, autoRefresh: current.autoRefresh === false ? 15000
+            : current.autoRefresh === 15000 ? 30000
+              : current.autoRefresh === 30000 ? 60000 : false }))
+        }, false, { title: 'Cycle auto-refresh period: off / 15s / 30s / 60s' }),
         action(dialogsQuery.isFetching ? 'Refreshing…' : 'Refresh', () => { setHiddenMessageIds(new Set()); void refreshAll(true) }, dialogsQuery.isFetching || waiting),
         action('New message', () => beginCompose(''), waiting)
         ] })
@@ -911,7 +924,12 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             note('Could not load this dialog history. Retry or pick another dialog.', true),
             action('Retry messages', () => { setHiddenMessageIds(new Set()); return messagesQuery.refetch() }, messagesQuery.isFetching)
           ] }),
-          !showTopics && messagesList.map(message => !hiddenMessageIds.has(messageKey(message.id)) && jsxs('article', { style: {
+          !showTopics && messagesList.map(message => !hiddenMessageIds.has(messageKey(message.id)) && jsxs('article', {
+            onContextMenu: event => {
+              event.preventDefault()
+              setPostMenu({ id: message.id, x: event.clientX, y: event.clientY })
+            },
+            style: {
             border: '1px solid var(--ui-stroke-secondary)', borderRadius: '0.5rem', padding: '0.5rem 0.6rem',
             display: 'flex', flexDirection: 'column', gap: '0.2rem',
           }, children: [
@@ -941,7 +959,27 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
                 waiting),
               message.replyTo && jsx('span', { style: muted, children: `↩ ${message.replyTo}` })
             ] })
-          ] }, `${message.id}`))
+          ] }, `${message.id}`)),
+          postMenu && jsxs('div', {
+            role: 'menu',
+            'aria-label': 'Post actions',
+            style: {
+              position: 'fixed', top: postMenu.y, left: postMenu.x, zIndex: 70,
+              display: 'flex', flexDirection: 'column', gap: '0.25rem', padding: '0.3rem',
+              background: 'var(--ui-bg-editor, var(--ui-bg-primary))', border: '1px solid var(--ui-stroke-secondary)',
+              borderRadius: '0.4rem', boxShadow: '0 8px 24px rgba(0, 0, 0, 0.35)',
+            },
+            onMouseLeave: () => setPostMenu(null),
+            children: [
+              topicId !== 1 && action('Mark as read', () => { setPostMenu(null); void requestMarkRead(postMenu.id, topicId) }, waiting),
+              (() => {
+                const menuLink = buildMessageTmeLink(dialogKey, postMenu.id, activeDialog?.webUsername)
+                return menuLink
+                  ? action('Open in browser', () => { setPostMenu(null); void ctx.os.openExternal(menuLink) }, false, { title: menuLink })
+                  : null
+              })(),
+            ],
+          })
         ] })
       ]
     }),

@@ -94,12 +94,13 @@ _mount_auth_router()
 _TELETHON_TIMEOUT_SECONDS = 20.0
 _DIALOG_SNAPSHOT_LIMIT = 500
 # Snapshot cache: manual refresh bypasses it (refresh=1), but folder/tab
-# switches and auto-refresh polls (30/60 s) reuse it. A 60 s TTL covers a full
-# 30 s poll cycle (and most of the 60 s one), so the poll never pays the
-# full Telegram RTT cost of a fresh dialog snapshot — only a forced refresh
-# does. ponytail: stale-unread up to 60 s off-manual-refresh; add per-folder
+# switches and auto-refresh polls reuse it. The TTL sits just under the
+# shortest auto-refresh period (15 s), so a 15 s poll still gets a fresh
+# dialogs snapshot while a tab switch inside 12 s stays instant — only a
+# forced refresh pays a full Telegram RTT inside that window.
+# ponytail: stale-unread up to 12 s off-manual-refresh; add per-folder
 # TTLs if stale badges start to matter.
-_DIALOG_CACHE_TTL_SECONDS = 60.0
+_DIALOG_CACHE_TTL_SECONDS = 12.0
 _TICKET_TTL_SECONDS = 300.0
 _MAX_TICKETS = 256
 _MAX_SCOPES = 128

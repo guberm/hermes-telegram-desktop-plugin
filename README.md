@@ -26,6 +26,12 @@ session on every request.
 4. Restart/reload plugins: ⌘K → **Reload desktop plugins**;
    a **Telegram** row appears in the sidebar, route `/telegram-client`.
 
+Pane controls: every post carries Reply / Mark read up to here / Open post in
+browser / Save / Delete, and a right-click on the post opens a small menu with
+**Mark as read** and **Open in browser** (it closes on Escape or when the
+pointer leaves it). The header button cycles auto-refresh Off → 15s → 30s →
+60s; **Refresh** always forces a fresh snapshot.
+
 With an unauthorized dedicated session, the page itself shows a login panel:
 phone login (code, then the 2FA password if configured) or QR. The backend
 builds the QR matrix; the Desktop pane only paints it.
