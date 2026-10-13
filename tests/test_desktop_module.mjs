@@ -96,7 +96,7 @@ const mediaLabelImpl = new Function(
 
 const defaults = 'const DEFAULT_SETTINGS = Object.freeze({ autoRefresh: false, unmutedOnly: false, unreadOnly: false, confirmActions: true, tab: \'all\' })\nconst settingsKey = (profile, me) => `telegram-settings:${profile}:${me}`'
 
-function makeTelegramPane(dialogs, messages = []) {
+function makeTelegramPane(dialogs, messages = [], topics = []) {
   const slots = []
   const restCalls = []
   let slot = 0
@@ -114,7 +114,7 @@ function makeTelegramPane(dialogs, messages = []) {
   const useEffect = () => { slot++ }
   const useQuery = ({ queryKey }) => queryKey.includes('dialogs')
     ? { data: { dialogs, folders: [{ id: 'all', title: 'All' }] }, isPending: false, isError: false, isFetching: false }
-    : { data: { topics: [], messages }, isPending: false, isError: false, isFetching: false }
+    : { data: { topics, messages }, isPending: false, isError: false, isFetching: false }
   const useMutation = ({ mutationFn }) => ({ isPending: false, reset() {}, mutateAsync: mutationFn })
   const testScope = 's'.repeat(32)
   const rest = async (path, options = {}) => {
@@ -556,6 +556,33 @@ test('context copy marks data as untrusted', () => {
   const text = context('me', { id: 1, text: 'hi' })
   assert.match(text, /UNTRUSTED TELEGRAM DATA/)
   assert.match(text, /"source": "telegram"/)
+})
+
+test('unmuted-only also filters muted forum topics', () => {
+  const render = makeTelegramPane(
+    [{ key: '@group', name: 'Group', muted: false, unread: 0, isForum: true, topMessageId: 42, folderIds: ['all'] }],
+    [],
+    [
+      { id: 11, title: 'Announcements', topMessage: 99, unread: 0, pinned: true, closed: false, muted: false },
+      { id: 13, title: 'Off-topic', topMessage: 42, unread: 0, pinned: false, closed: false, muted: true },
+    ],
+  )
+  const treeNodes = tree => Array.isArray(tree) ? tree.flatMap(treeNodes)
+    : tree && typeof tree === 'object' ? [tree, ...treeNodes(tree.props?.children)] : []
+  const topicLabels = tree => treeNodes(tree)
+    .filter(node => node.type === 'button' && typeof node.props['aria-label'] === 'string'
+      && node.props['aria-label'].startsWith('Open topic'))
+    .map(node => node.props['aria-label'])
+  let tree = render()
+  treeNodes(tree).find(node => node.type === 'button' && node.props.children?.[0]?.props?.children === 'Group').props.onClick()
+  tree = render()
+  assert.deepEqual(topicLabels(tree), ['Open topic Announcements', 'Open topic Off-topic'],
+    'with the switch off every topic is listed')
+  treeNodes(tree).find(node => node.type === 'button' && node.props.role === 'switch'
+    && typeof node.props.children === 'string' && node.props.children.includes('Unmuted only')).props.onClick()
+  tree = render()
+  assert.deepEqual(topicLabels(tree), ['Open topic Announcements'],
+    'the switch hides muted topics, matching the dialog list')
 })
 
 test('auto-refresh cycles off → 15s → 30s → 60s → off', () => {

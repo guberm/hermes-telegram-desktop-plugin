@@ -609,6 +609,7 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
     refetchInterval: settings.autoRefresh === false ? false : settings.autoRefresh,
   })
   const topicsList = Array.isArray(topicsQuery.data?.topics) ? topicsQuery.data.topics : []
+  const visibleTopics = settings.unmutedOnly ? topicsList.filter(topic => topic.muted !== true) : topicsList
   const activeTopic = topicsList.find(topic => topic.id === topicId)
   const showTopics = !!activeDialog?.isForum && topicId === 0
   const messagesQuery = useQuery({
@@ -903,7 +904,9 @@ function TelegramPane({ ctx, identity, profile, queryPrefix: connectionPrefix, s
             action('Retry topics', () => topicsQuery.refetch(), topicsQuery.isFetching)
           ] }),
           showTopics && !topicsQuery.isPending && !topicsQuery.isError && topicsList.length === 0 && note('No forum topics were returned.'),
-          showTopics && topicsList.map(topic => jsx('button', {
+          showTopics && !topicsQuery.isPending && !topicsQuery.isError && topicsList.length > 0 && visibleTopics.length === 0
+            && note('Every topic is muted; turn off “Unmuted only” to see them.'),
+          showTopics && visibleTopics.map(topic => jsx('button', {
             type: 'button', 'aria-label': `Open topic ${topic.title || topic.id}`,
             onClick: () => setTopicId(topic.id),
             style: {

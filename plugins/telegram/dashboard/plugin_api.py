@@ -1017,6 +1017,8 @@ def topics(
                     "unread": int(topic.unread_count or 0),
                     "pinned": bool(topic.pinned),
                     "closed": bool(topic.closed),
+                    # A topic carries its own notify settings; reuse the dialog rule.
+                    "muted": _dialog_is_muted(topic),
                 })
             elif isinstance(topic, tl_types.ForumTopicDeleted):
                 continue

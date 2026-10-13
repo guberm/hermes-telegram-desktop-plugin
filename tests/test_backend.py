@@ -1222,6 +1222,7 @@ class SaveActionTests(unittest.TestCase):
 
 class ForumTopicsRouteTests(unittest.TestCase):
     def test_topics_serialization_and_nonforum_detection(self):
+        from datetime import datetime, timedelta, timezone
         from telethon.tl.types import ForumTopic, ForumTopicDeleted, PeerChannel, PeerNotifySettings, PeerUser
 
         entity = SimpleNamespace(id=123, title="Test Group", username="group", forum=True)
@@ -1232,6 +1233,14 @@ class ForumTopicsRouteTests(unittest.TestCase):
             unread_poll_votes_count=0, from_id=PeerUser(1), notify_settings=PeerNotifySettings(),
             pinned=True, closed=False,
         )
+        muted_topic = ForumTopic(
+            id=13, date=None, peer=PeerChannel(123), title="Off-topic", icon_color=0,
+            top_message=42, read_inbox_max_id=42, read_outbox_max_id=0,
+            unread_count=0, unread_mentions_count=0, unread_reactions_count=0,
+            unread_poll_votes_count=0, from_id=PeerUser(1),
+            notify_settings=PeerNotifySettings(mute_until=datetime.now(timezone.utc) + timedelta(hours=1)),
+            pinned=False, closed=False,
+        )
         class Client:
             requests = []
 
@@ -1240,7 +1249,7 @@ class ForumTopicsRouteTests(unittest.TestCase):
 
             async def __call__(self, request):
                 self.requests.append(request)
-                return SimpleNamespace(topics=[topic, ForumTopicDeleted(id=12)])
+                return SimpleNamespace(topics=[topic, muted_topic, ForumTopicDeleted(id=12)])
 
         client = Client()
 
@@ -1261,7 +1270,10 @@ class ForumTopicsRouteTests(unittest.TestCase):
         self.assertEqual(client.requests[0].limit, 12)
         self.assertEqual(result["topics"], [{
             "id": 11, "title": "Announcements", "topMessage": 99,
-            "readInboxMaxId": 80, "unread": 3, "pinned": True, "closed": False,
+            "readInboxMaxId": 80, "unread": 3, "pinned": True, "closed": False, "muted": False,
+        }, {
+            "id": 13, "title": "Off-topic", "topMessage": 42,
+            "readInboxMaxId": 42, "unread": 0, "pinned": False, "closed": False, "muted": True,
         }])
         self.assertEqual(json.loads(json.dumps(result))["isForum"], True)
         self.assertEqual(nonforum, {"peer": "Test Group", "isForum": False, "topics": [], "me": "Me"})
